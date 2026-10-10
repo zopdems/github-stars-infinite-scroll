@@ -2,7 +2,7 @@
 // @name         GitHub Stars 无限滚动
 // @name:zh-CN   GitHub Stars 无限滚动
 // @namespace    https://github.com/
-// @version      1.0.0
+// @version      1.1.0
 // @description  在任意 GitHub 用户的 Stars 标签页实现无限滚动：滚动接近底部自动加载下一页并追加到列表末尾，隐藏原生分页按钮，加载完给出「已到底」提示，失败后滚动即可重试。
 // @author       zopdems
 // @license      MIT
@@ -44,7 +44,14 @@
     maxRetry: 3,                   // 同一页自动重试次数
     backoffMs: 1500,               // 失败重试的基础退避（ms），实际 = backoffMs * 失败次数
     maxPages: 500,                 // 安全阀：最多加载多少页
-    debug: false                   // 打开后会在控制台打印日志
+    debug: false,                  // 打开后会在控制台打印日志
+
+    /* ---- 长列表性能（几百上千条时的卡顿/白屏）---- */
+    contentVisibility: true, // 视口外的条目跳过布局与绘制，卡顿和回滚白屏的主要解法
+    itemHeight: 128,         // 条目占位高度估计（px），仅用于滚动条，实际渲染后会自动校正
+    chunkSize: 8,            // 每帧最多挂载几个条目，避免一次性 30 条造成长任务
+    prefetchPx: 3000,        // 空闲时提前预取的距离（消掉下滑时的"等待期"）
+    softCap: 0               // 0 = 不限；>0 表示加载到该数量后改为手动点「继续」
   };
 
   // GitHub 保留路径，避免把 /topics/xxx 之类误认为用户名
@@ -84,8 +91,28 @@
     lastLoad: 0,
     scheduled: null,
     retryHandler: null,
-    moTimer: null
+    moTimer: null,
+    capReleased: false,
+    prefetching: false
   };
+
+  /* ======================= 主线程让出工具 ======================= */
+
+  // 让出一帧：把长任务切成小块，滚动时不再被 append 卡住
+  const nextFrame = () => new Promise(resolve => requestAnimationFrame(() => resolve()));
+
+  // 空闲时再做：requestIdleCallback 不可用就退化成 setTimeout
+  function onIdle(fn, timeout) {
+    if (typeof window.requestIdleCallback === 'function') {
+      return window.requestIdleCallback(fn, { timeout: timeout || 1000 });
+    }
+    return setTimeout(fn, 1);
+  }
+
+  /** 给条目打标记，使其享受 content-visibility 优化 */
+  function markItem(node) {
+    if (CONFIG.contentVisibility) node.classList.add('ghsi-item');
+  }
 
   /* ======================= 页面识别与工具 ======================= */
 
@@ -174,6 +201,14 @@ html.${HTML_FLAG} main [data-test-selector="pagination"] { display: none !import
 /* 2) 触发哨兵 */
 #${SENTINEL_ID} { height: 1px; width: 100%; }
 
+/* 2.5) 长列表性能：视口外的条目跳过布局与绘制。
+   条目真实渲染过一次后浏览器会记住实际高度（auto 关键字），
+   所以滚动条长度不会跑偏；这里给的高度只是首次出现前的占位估计。 */
+html.${HTML_FLAG} .ghsi-item {
+  content-visibility: auto;
+  contain-intrinsic-height: auto var(--ghsi-item-h, 128px);
+}
+
 /* 3) 状态提示胶囊 */
 #${STATUS_ID} {
   position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);
@@ -210,6 +245,8 @@ html.${HTML_FLAG} main [data-test-selector="pagination"] { display: none !import
   #${STATUS_ID} .ghsi-spin { animation-duration: 2s; }
 }
 `;
+    // 条目占位高度由 CONFIG.itemHeight 决定，用 CSS 变量传给样式表
+    document.documentElement.style.setProperty('--ghsi-item-h', CONFIG.itemHeight + 'px');
     const style = document.createElement('style');
     style.id = STYLE_ID;
     style.textContent = css;
@@ -228,7 +265,8 @@ html.${HTML_FLAG} main [data-test-selector="pagination"] { display: none !import
     return el;
   }
 
-  function setStatus(kind, text) {
+  /** kind: idle | loading | error | done；action: { label, onClick } 可选 */
+  function setStatus(kind, text, action) {
     const el = ensureStatusEl();
     el.dataset.state = kind;
     el.innerHTML = '';
@@ -240,16 +278,22 @@ html.${HTML_FLAG} main [data-test-selector="pagination"] { display: none !import
     const t = document.createElement('span');
     t.textContent = text;
     el.appendChild(t);
-    if (kind === 'error') {
+    if (kind === 'error' && !action) {
+      action = {
+        label: '重试',
+        onClick: () => {
+          state.fails = 0;
+          unbindRetryOnScroll();
+          maybeLoad(true);
+        }
+      };
+    }
+    if (action) {
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.className = 'ghsi-btn';
-      btn.textContent = '重试';
-      btn.addEventListener('click', () => {
-        state.fails = 0;
-        unbindRetryOnScroll();
-        maybeLoad(true);
-      });
+      btn.textContent = action.label;
+      btn.addEventListener('click', action.onClick);
       el.appendChild(btn);
     }
   }
@@ -283,11 +327,27 @@ html.${HTML_FLAG} main [data-test-selector="pagination"] { display: none !import
     loadNext(force);
   }
 
+  /** 软上限：加载太多条目会让页面变重，到量后改为手动点「继续」 */
+  function atSoftCap() {
+    return CONFIG.softCap > 0 && !state.capReleased && state.seen.size >= CONFIG.softCap;
+  }
+
+  function showCapStatus() {
+    setStatus('idle', '已加载 ' + state.seen.size + ' 个仓库 · 已达软上限', {
+      label: '继续',
+      onClick: () => {
+        state.capReleased = true;
+        maybeLoad(true);
+      }
+    });
+  }
+
   async function loadNext(force) {
     if (state.done || state.loading) return;
 
     if (!state.nextUrl) { finish(); return; }
     if (state.page >= CONFIG.maxPages) { finish(); return; }
+    if (atSoftCap()) { showCapStatus(); return; }
 
     // 节流：两次请求之间至少间隔 minIntervalMs
     const wait = CONFIG.minIntervalMs - (Date.now() - state.lastLoad);
@@ -325,7 +385,9 @@ html.${HTML_FLAG} main [data-test-selector="pagination"] { display: none !import
         return;
       }
 
-      const added = appendItems(items);
+      // 先让出一帧再动手挂载，别和正在进行的滚动抢主线程
+      await nextFrame();
+      const added = await appendItems(items);
       state.nextUrl = extractNextUrl(doc);
       state.fails = 0;
       state.loading = false;
@@ -334,8 +396,10 @@ html.${HTML_FLAG} main [data-test-selector="pagination"] { display: none !import
         finish();
         return;
       }
+      if (atSoftCap()) { showCapStatus(); return; }
       setStatus('idle', '已加载 ' + state.seen.size + ' 个仓库 · 继续向下滚动');
       afterAppend();
+      schedulePrefetch();
     } catch (err) {
       state.loading = false;
       state.page -= 1;
@@ -357,31 +421,61 @@ html.${HTML_FLAG} main [data-test-selector="pagination"] { display: none !import
     }
   }
 
-  /** 追加条目（按 owner/repo 去重），返回新增数量 */
-  function appendItems(items) {
-    const frag = document.createDocumentFragment();
-    let added = 0;
+  /**
+   * 追加条目（按 owner/repo 去重），返回新增数量。
+   * 分块挂载：每块最多 chunkSize 条，块与块之间让出一帧。
+   * 一次性挂载 30 条（每条含内联 SVG）会形成一个几十毫秒的长任务，
+   * 正好卡在滚动帧上 —— 这就是"下滑卡顿"的来源。
+   */
+  async function appendItems(items) {
+    const pending = [];
     for (const el of items) {
       const key = itemKey(el);
       if (!key || state.seen.has(key)) continue;
       state.seen.add(key);
-      const node = document.importNode(el, true);
-      node.setAttribute('data-gh-star-page', String(state.page));
-      frag.appendChild(node);
-      added += 1;
+      pending.push(el);
     }
-    if (added) state.frame.appendChild(frag);
+    if (!pending.length) return 0;
+
+    let added = 0;
+    const size = Math.max(1, CONFIG.chunkSize);
+    for (let i = 0; i < pending.length; i += size) {
+      const frag = document.createDocumentFragment();
+      for (const el of pending.slice(i, i + size)) {
+        const node = document.importNode(el, true);
+        node.setAttribute('data-gh-star-page', String(state.page));
+        markItem(node);
+        frag.appendChild(node);
+        added += 1;
+      }
+      state.frame.appendChild(frag);
+      if (i + size < pending.length) await nextFrame();  // 留出渲染机会
+    }
     log('追加', added, '条，累计', state.seen.size);
     return added;
   }
 
-  /** 追加后如果哨兵仍在可视范围内（比如条目很矮），继续拉下一页 */
+  /**
+   * 追加后重新观察哨兵：若它仍在预取范围内，IntersectionObserver 会再次回调。
+   * 用重新 observe 代替 getBoundingClientRect —— 后者会在一个已经很长的
+   * 列表上触发一次强制同步布局，滚一次卡一次。
+   */
   function afterAppend() {
-    requestAnimationFrame(() => {
+    if (state.done || state.loading || !state.sentinel || !state.observer) return;
+    state.observer.unobserve(state.sentinel);
+    state.observer.observe(state.sentinel);
+  }
+
+  /** 空闲时提前多取一页，消掉下滑到 Boundary 时的那段"等待期" */
+  function schedulePrefetch() {
+    if (state.done || state.prefetching || !CONFIG.prefetchPx || !state.sentinel) return;
+    state.prefetching = true;
+    onIdle(() => {
+      state.prefetching = false;
       if (state.done || state.loading || !state.sentinel) return;
       const r = state.sentinel.getBoundingClientRect();
-      if (r.top < window.innerHeight + CONFIG.preloadPx) maybeLoad();
-    });
+      if (r.top < window.innerHeight + CONFIG.prefetchPx) maybeLoad();
+    }, 2000);
   }
 
   function finish() {
@@ -453,10 +547,13 @@ html.${HTML_FLAG} main [data-test-selector="pagination"] { display: none !import
     state.loading = false;
     state.fails = 0;
 
-    // 用页面上已有的条目铺底，避免重复
+    // 用页面上已有的条目铺底，避免重复；同时给它们打上优化标记
+    // （首页那 30 条同样参与长列表渲染，不标记的话第一屏之后照样卡）
     for (const el of extractItems(frame)) {
       const k = itemKey(el);
-      if (k) state.seen.add(k);
+      if (!k) continue;
+      state.seen.add(k);
+      markItem(el);
     }
     state.nextUrl = extractNextUrl(frame);
 
@@ -494,6 +591,8 @@ html.${HTML_FLAG} main [data-test-selector="pagination"] { display: none !import
     state.page = 1;
     state.fails = 0;
     state.seen = new Set();
+    state.capReleased = false;
+    state.prefetching = false;
   }
 
   function boot() {

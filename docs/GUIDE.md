@@ -253,7 +253,14 @@ const CONFIG = {
   maxRetry: 3,                   // 同一页自动重试次数
   backoffMs: 1500,               // 失败退避基数，实际延迟 = backoffMs × 失败次数
   maxPages: 500,                 // 安全阀，最多加载多少页
-  debug: false                   // 置 true 后控制台打印日志
+  debug: false,                  // 置 true 后控制台打印日志
+
+  /* ---- 长列表性能（几百上千条时的卡顿/白屏）---- */
+  contentVisibility: true, // 视口外的条目跳过布局与绘制，卡顿和回滚白屏的主要解法
+  itemHeight: 128,         // 条目占位高度估计（px），仅用于滚动条，实际渲染后会自动校正
+  chunkSize: 8,            // 每帧最多挂载几个条目，避免一次性 30 条造成长任务
+  prefetchPx: 3000,        // 空闲时提前预取的距离（消掉下滑时的"等待期"）
+  softCap: 0               // 0 = 不限；>0 表示加载到该数量后改为手动点「继续」
 };
 ```
 
@@ -281,7 +288,67 @@ GHStarsInfinite.config.debug = true
 
 ---
 
-## 七、验证记录
+## 七、长列表性能：为什么会卡、为什么回滚会白屏
+
+星标数到几百上千（比如 810 个 / 27 页）时，会出现「下滑有等待期 → 卡顿 → 往上翻一片空白」。
+
+### 先量一下，别瞎猜
+
+实测单个条目：**2.2KB、约 16 个元素**（2 个内联 SVG、1 个 `<relative-time>`、无 `<details>` / 无 `<form>` / 无 `<script>`）。
+810 条合计约 **1.7MB HTML、约 1.3 万 DOM 节点**。
+
+这个规模**不足以**让 Chrome 白屏 —— 所以瓶颈不在 DOM 规模，而在**渲染**：一屏之外的近千个条目全部要参与布局和光栅化，滚动时光栅化跟不上就直接显示白块。对症下药才有意义。
+
+### 三处改动
+
+**1. `content-visibility: auto`（治白屏，收益最大）**
+
+```css
+html.gh-stars-infinite .ghsi-item {
+  content-visibility: auto;
+  contain-intrinsic-height: auto var(--ghsi-item-h, 128px);
+}
+```
+
+视口外的条目直接跳过布局与绘制，需要光栅化的内容少掉 95%。注意两点：
+
+- 占位高度用了 `auto` 关键字，条目真实渲染过一次后浏览器会**记住实际高度**，所以滚动条长度不会跑偏；`128px` 只是首次出现前的估计值，不准也没关系。
+- **首页那 30 条也要打标记**（`reset()` 里就打了），只标记追加的条目没用 —— 第一屏之后照样要绘制。
+
+**2. 分块挂载（治卡顿）**
+
+```js
+const size = Math.max(1, CONFIG.chunkSize);          // 默认 8
+for (let i = 0; i < pending.length; i += size) {
+  const frag = document.createDocumentFragment();
+  for (const el of pending.slice(i, i + size)) { /* importNode + 打标记 */ }
+  state.frame.appendChild(frag);
+  if (i + size < pending.length) await nextFrame();  // 块间让出一帧
+}
+```
+
+一次性挂载 30 个含 SVG 的节点会形成一个几十毫秒的长任务，正好卡在滚动帧上。切成 8 条一块、块间 `await nextFrame()`，每帧都留出渲染机会。
+
+**3. 去掉强制同步布局**
+
+原来 `afterAppend()` 用 `getBoundingClientRect()` 判断哨兵位置 —— 在一个已经很长的列表上，这会触发一次**强制同步布局**，滚一次卡一次。改成重新 `observe` 哨兵，让 `IntersectionObserver` 异步回调：
+
+```js
+state.observer.unobserve(state.sentinel);
+state.observer.observe(state.sentinel);   // 仍在范围内就会再次回调，不同步布局
+```
+
+### 顺带修掉的「等待期」
+
+`CONFIG.prefetchPx = 3000`：每次加载成功后，用 `requestIdleCallback` 在空闲时检查哨兵距离，够近就**提前把下一页取好**。这样等待发生在你阅读的时候，而不是你滚到底的时候。
+
+### 还想更保守
+
+把 `CONFIG.softCap` 设成数字（如 300）：加载到这里会停下并显示一个「继续」按钮，避免一次性堆太多节点。默认 `0` = 不限。
+
+---
+
+## 八、验证记录
 
 脚本不是"写完就交"，做了两轮实测验证：
 
@@ -300,3 +367,12 @@ GHStarsInfinite.config.debug = true
 - 每次请求都带 `Turbo-Frame: user-starred-repos` 与 `X-Requested-With` 头
 - 注入一次网络失败 → 失败计数 +1、状态条转 `error` + 出现「重试」按钮、**不误判为到底**；派发 `scroll` 事件后自动重试成功，计数归零
 - 到底后等待 700ms 让 `MutationObserver` 触发，确认不会重启加载（第三节第 8 点的回归项）
+
+**性能改动回归（v1.1.0，18 项断言全过）**
+
+- 样式表含 `content-visibility: auto` 与 `contain-intrinsic-height: auto var(--ghsi-item-h)`；`--ghsi-item-h` 按 `CONFIG.itemHeight` 正确注入
+- 首页 30 条**也**被打上优化标记；追加的条目同样带标记与页码属性
+- 30 条按 `chunkSize=8` 切成多块，一次加载让出 4 帧（含挂载前的一帧）
+- 软上限：达到阈值后状态条出现「继续」按钮，点击解除并继续加载
+- `contentVisibility: false` 时完全不打标记（开关可退回原行为）
+- 回归：重复内容触发「已到底」、到底后不被重启、空闲预取会提前加载
