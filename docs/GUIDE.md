@@ -260,6 +260,7 @@ const CONFIG = {
   itemHeight: 128,         // 条目占位高度估计（px），仅用于滚动条，实际渲染后会自动校正
   chunkSize: 8,            // 每帧最多挂载几个条目，避免一次性 30 条造成长任务
   prefetchPx: 3000,        // 空闲时提前预取的距离（消掉下滑时的"等待期"）
+  maxBurstPages: 3,        // 一轮连续自动加载几页就停（0 = 不限）。停下后滚动或点「继续」再加载下一轮
   softCap: 0               // 0 = 不限；>0 表示加载到该数量后改为手动点「继续」
 };
 ```
@@ -342,9 +343,44 @@ state.observer.observe(state.sentinel);   // 仍在范围内就会再次回调�
 
 `CONFIG.prefetchPx = 3000`：每次加载成功后，用 `requestIdleCallback` 在空闲时检查哨兵距离，够近就**提前把下一页取好**。这样等待发生在你阅读的时候，而不是你滚到底的时候。
 
+### 4. 一轮只加载三页，别一口气灌完
+
+即便渲染优化到位，一口气把 27 页全加载完也没必要 —— DOM 照样会堆到 810 个条目。所以默认加了**每轮上限**：
+
+```js
+maxBurstPages: 3,   // 一轮连续自动加载 3 页就停，滚动或点「继续」再开下一轮
+```
+
+行为是：
+
+- 自动路径（哨兵触发、空闲预取）**每轮最多 3 页**，满了就停，状态条给一个「继续」按钮
+- **继续滚动**即重置计数，开始下一轮 3 页
+- 手动点「继续」、控制台 `GHStarsInfinite.loadMore()`、失败重试**不受此限制**（`force` 路径）
+
+实现上只有两点要注意：
+
+```js
+// 只约束自动路径，手动/重试走 force，不该被限制住
+if (CONFIG.maxBurstPages > 0 && !force && state.burst >= CONFIG.maxBurstPages) {
+  showBurstPause();
+  return;
+}
+
+// 滚动才重置计数；重置后重新 observe，由 IntersectionObserver 判断该不该真的加载
+// —— 直接加载的话，用户在页面顶部随便滑一下也会触发
+function onUserScroll() {
+  if (!state.burstPaused || state.done || state.loading) return;
+  state.burstPaused = false;
+  state.burst = 0;
+  afterAppend();
+}
+```
+
 ### 还想更保守
 
 把 `CONFIG.softCap` 设成数字（如 300）：加载到这里会停下并显示一个「继续」按钮，避免一次性堆太多节点。默认 `0` = 不限。
+
+`maxBurstPages` 管的是**一轮加载多少**，`softCap` 管的是**一共加载多少**，两者可以同时用。
 
 ---
 
@@ -376,3 +412,12 @@ state.observer.observe(state.sentinel);   // 仍在范围内就会再次回调�
 - 软上限：达到阈值后状态条出现「继续」按钮，点击解除并继续加载
 - `contentVisibility: false` 时完全不打标记（开关可退回原行为）
 - 回归：重复内容触发「已到底」、到底后不被重启、空闲预取会提前加载
+
+**每轮页数上限（v1.2.0，15 项断言全过，用合成页面精确控制游标）**
+
+- 连触 3 次哨兵 → 累计 120 条、`burst = 3`
+- 第 4 次不再加载、进入暂停、状态条出现「继续」按钮
+- 派发 `scroll` → 暂停解除、计数归零，新一轮又是 3 页（累计 210）后再次停住
+- 点「继续」按钮 → 立即加载一页（240）并解除暂停
+- `maxBurstPages = 0` 时 5 次触发全部加载，不会暂停
+- 手动/重试走 `force` 路径，不被每轮上限挡住

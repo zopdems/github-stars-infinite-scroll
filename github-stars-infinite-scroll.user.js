@@ -2,7 +2,7 @@
 // @name         GitHub Stars 无限滚动
 // @name:zh-CN   GitHub Stars 无限滚动
 // @namespace    https://github.com/
-// @version      1.1.0
+// @version      1.2.0
 // @description  在任意 GitHub 用户的 Stars 标签页实现无限滚动：滚动接近底部自动加载下一页并追加到列表末尾，隐藏原生分页按钮，加载完给出「已到底」提示，失败后滚动即可重试。
 // @author       zopdems
 // @license      MIT
@@ -51,6 +51,7 @@
     itemHeight: 128,         // 条目占位高度估计（px），仅用于滚动条，实际渲染后会自动校正
     chunkSize: 8,            // 每帧最多挂载几个条目，避免一次性 30 条造成长任务
     prefetchPx: 3000,        // 空闲时提前预取的距离（消掉下滑时的"等待期"）
+    maxBurstPages: 3,        // 一轮连续自动加载几页就停（0 = 不限）。停下后滚动或点「继续」再加载下一轮
     softCap: 0               // 0 = 不限；>0 表示加载到该数量后改为手动点「继续」
   };
 
@@ -93,7 +94,9 @@
     retryHandler: null,
     moTimer: null,
     capReleased: false,
-    prefetching: false
+    prefetching: false,
+    burst: 0,
+    burstPaused: false
   };
 
   /* ======================= 主线程让出工具 ======================= */
@@ -342,12 +345,39 @@ html.${HTML_FLAG} .ghsi-item {
     });
   }
 
+  /** 一轮加载够了：停下，等用户继续滚动或点「继续」再开下一轮 */
+  function showBurstPause() {
+    state.burstPaused = true;
+    setStatus('idle', '已加载 ' + state.seen.size + ' 个仓库 · 继续向下滚动', {
+      label: '继续',
+      onClick: () => {
+        state.burst = 0;
+        state.burstPaused = false;
+        maybeLoad(true);
+      }
+    });
+  }
+
+  /** 用户真的滚动了 -> 重置一轮的计数，并让 IO 重新判断是否继续加载 */
+  function onUserScroll() {
+    if (!state.burstPaused || state.done || state.loading) return;
+    state.burstPaused = false;
+    state.burst = 0;
+    afterAppend();   // 重新 observe：由 IntersectionObserver 判断哨兵是否还在范围内
+  }
+
   async function loadNext(force) {
     if (state.done || state.loading) return;
 
     if (!state.nextUrl) { finish(); return; }
     if (state.page >= CONFIG.maxPages) { finish(); return; }
     if (atSoftCap()) { showCapStatus(); return; }
+    // 一轮最多加载 maxBurstPages 页，别一口气把几十页全灌进 DOM。
+    // 只约束「自动」路径（哨兵/预取）；手动点继续、控制台调用、失败重试不受限。
+    if (CONFIG.maxBurstPages > 0 && !force && state.burst >= CONFIG.maxBurstPages) {
+      showBurstPause();
+      return;
+    }
 
     // 节流：两次请求之间至少间隔 minIntervalMs
     const wait = CONFIG.minIntervalMs - (Date.now() - state.lastLoad);
@@ -391,6 +421,7 @@ html.${HTML_FLAG} .ghsi-item {
       state.nextUrl = extractNextUrl(doc);
       state.fails = 0;
       state.loading = false;
+      if (added > 0) state.burst += 1;   // 只有真的加进了新条目才算这一轮用掉一页
 
       if (!state.nextUrl || added === 0) {
         finish();
@@ -593,6 +624,8 @@ html.${HTML_FLAG} .ghsi-item {
     state.seen = new Set();
     state.capReleased = false;
     state.prefetching = false;
+    state.burst = 0;
+    state.burstPaused = false;
   }
 
   function boot() {
@@ -638,6 +671,9 @@ html.${HTML_FLAG} .ghsi-item {
     }, 250);
   });
   mo.observe(document.documentElement, { childList: true, subtree: true });
+
+  // 用户滚动时解除"一轮加载够了"的暂停（只在暂停时才有动作，平时零开销）
+  window.addEventListener('scroll', onUserScroll, { passive: true });
 
   boot();
 
