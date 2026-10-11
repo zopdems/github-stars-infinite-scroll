@@ -2,8 +2,8 @@
 // @name         GitHub Stars 无限滚动
 // @name:zh-CN   GitHub Stars 无限滚动
 // @namespace    https://github.com/
-// @version      1.2.0
-// @description  在任意 GitHub 用户的 Stars 标签页实现无限滚动：滚动接近底部自动加载下一页并追加到列表末尾，隐藏原生分页按钮，加载完给出「已到底」提示，失败后滚动即可重试。
+// @version      1.3.0
+// @description  在任意 GitHub 用户的 Stars 标签页实现无限滚动：滚动接近底部自动加载下一页并追加到列表末尾，隐藏原生分页按钮，加载完给出「已到底」提示，失败后滚动即可重试；支持滚动回收——把视口上方已浏览的整页换成等高占位块，回看时再补回，长列表（几百上千个星标）不再卡顿。
 // @author       zopdems
 // @license      MIT
 // @homepageURL  https://github.com/zopdems/github-stars-infinite-scroll
@@ -52,7 +52,12 @@
     chunkSize: 8,            // 每帧最多挂载几个条目，避免一次性 30 条造成长任务
     prefetchPx: 3000,        // 空闲时提前预取的距离（消掉下滑时的"等待期"）
     maxBurstPages: 3,        // 一轮连续自动加载几页就停（0 = 不限）。停下后滚动或点「继续」再加载下一轮
-    softCap: 0               // 0 = 不限；>0 表示加载到该数量后改为手动点「继续」
+    softCap: 0,              // 0 = 不限；>0 表示加载到该数量后改为手动点「继续」
+
+    /* ---- 滚动回收：解决"加载全了之后继续浏览卡顿" ---- */
+    recycle: true,           // 开启后，视口上方已翻过去的整页会被摘成等高占位块，回看时再补回
+    recycleAbovePx: 1400,    // 整页滑出视口上方超过这个距离（px）就回收；回看时占位块进入该距离内即补回
+    maxCachedPages: 0        // 0=缓存所有已加载页（回看瞬时补回）；>0=只保留最近 N 页的节点，更久远的回看会重新拉取
   };
 
   // GitHub 保留路径，避免把 /topics/xxx 之类误认为用户名
@@ -85,6 +90,9 @@
     observer: null,
     nextUrl: null,
     seen: new Set(),
+    pages: [],              // 按加载顺序：每页一个对象 {index,nodes,url,nextUrl,realHeight,recycled,placeholder,fetching}
+    pageMap: {},            // index -> pages 中的对象，O(1) 查找
+    loadedUrl: null,        // 当前正在/刚加载这一页用的请求 URL（供回看重新拉取）
     page: 1,
     loading: false,
     done: false,
@@ -96,7 +104,9 @@
     capReleased: false,
     prefetching: false,
     burst: 0,
-    burstPaused: false
+    burstPaused: false,
+    recycleScheduled: false,
+    lastScrollY: 0
   };
 
   /* ======================= 主线程让出工具 ======================= */
@@ -115,6 +125,152 @@
   /** 给条目打标记，使其享受 content-visibility 优化 */
   function markItem(node) {
     if (CONFIG.contentVisibility) node.classList.add('ghsi-item');
+  }
+
+  /* ======================= 滚动回收 / 回看补回 =======================
+   * 思路：把"已加载的每一页"整块缓存下来（state.pages）。
+   *   - 整页滑出视口上方超过 recycleAbovePx  -> 把这一页的真实节点从 DOM 摘掉，
+   *     换成唯一一个等高占位块（高度 = 该页真实高度）。滚动位置不跳变，
+   *     因为占位块高度与摘掉的节点总高一致。
+   *   - 往上回看，占位块重新进入 recycleAbovePx 距离内 -> 把缓存的真实节点插回原位。
+   *     缓存被驱逐时（maxCachedPages>0）才走网络重新拉取。
+   * 这样无论加载多少页，DOM 里始终只保留"视口附近几页"，长列表不再卡顿。
+   * ================================================================== */
+
+  /** 把一页整块回收成等高占位块（节点已不在 DOM 里，仅留占位块） */
+  function recyclePage(page) {
+    if (page.recycled || !page.nodes || !page.nodes.length) return;
+    const lastNode = page.nodes[page.nodes.length - 1];
+    const nextSib = lastNode.nextSibling; // 记录插入点，回收后占位块插在这儿
+
+    // 测量真实高度（只测一次并缓存）：content-visibility:auto 下离屏节点仍占其固有高度
+    let h = page.realHeight;
+    if (h == null) {
+      h = 0;
+      for (const n of page.nodes) h += (n.getBoundingClientRect().height || CONFIG.itemHeight);
+      page.realHeight = h || CONFIG.itemHeight * page.nodes.length;
+    }
+
+    const ph = document.createElement('div');
+    ph.className = 'ghsi-pholder';
+    ph.style.height = page.realHeight + 'px';
+    ph.dataset.ghPage = String(page.index);
+    state.frame.insertBefore(ph, nextSib);
+    page.nodes.forEach(n => n.remove());
+    page.placeholder = ph;
+    page.recycled = true;
+    log('回收第', page.index, '页（', page.nodes.length, '条 -> 占位块', Math.round(page.realHeight), 'px）');
+  }
+
+  /** 把占位块补回成真实节点（优先用缓存，缓存被驱逐则重新拉取） */
+  function rehydratePage(page) {
+    if (!page.recycled) return;
+    const ph = page.placeholder;
+    if (!ph || !ph.isConnected) return;
+
+    if (page.nodes && page.nodes.length) {
+      const nextSib = ph.nextSibling;
+      const frag = document.createDocumentFragment();
+      for (const n of page.nodes) frag.appendChild(n);
+      state.frame.insertBefore(frag, nextSib);
+      ph.remove();
+      page.placeholder = null;
+      page.recycled = false;
+      log('补回第', page.index, '页（缓存，', page.nodes.length, '条）');
+    } else {
+      rehydratePageAsync(page);   // 缓存没了，走网络
+    }
+  }
+
+  /** 缓存被驱逐时的异步补回：用这一页当初的 URL 重新拉取并插回 */
+  async function rehydratePageAsync(page) {
+    if (page.fetching) return;
+    page.fetching = true;
+    const ph = state.frame.querySelector('.ghsi-pholder[data-gh-page="' + page.index + '"]');
+    try {
+      if (!ph) { page.fetching = false; return; }
+      const html = await fetchPage(page.url, true);
+      const doc = parseDoc(html);
+      const frame = findFrame(doc);
+      const items = extractItems(frame);
+      const nodes = [];
+      for (const el of items) {
+        const key = itemKey(el);
+        if (!key) continue;
+        const node = document.importNode(el, true);
+        node.setAttribute('data-gh-star-page', String(page.index));
+        markItem(node);
+        nodes.push(node);
+      }
+      page.nodes = nodes;
+      if (!nodes.length) { page.fetching = false; return; }
+      const frag = document.createDocumentFragment();
+      for (const n of nodes) frag.appendChild(n);
+      const phNow = state.frame.querySelector('.ghsi-pholder[data-gh-page="' + page.index + '"]');
+      if (phNow) state.frame.insertBefore(frag, phNow.nextSibling);
+      if (phNow) phNow.remove();
+      page.placeholder = null;
+      page.recycled = false;
+      log('补回第', page.index, '页（重新拉取，', nodes.length, '条）');
+    } catch (e) {
+      warn('回看补回失败（第 ' + page.index + ' 页）：', (e && e.message) || e);
+      // 占位块保留，下次滚动到它附近再试
+    } finally {
+      page.fetching = false;
+    }
+  }
+
+  /** 驱逐过多缓存：只回收过的页里，除最近 maxCachedPages 页外，清掉节点缓存 */
+  function maybeEvictCache() {
+    if (CONFIG.maxCachedPages <= 0) return;
+    const cached = state.pages.filter(p => p.recycled && p.nodes && p.nodes.length);
+    if (cached.length <= CONFIG.maxCachedPages) return;
+    const toEvict = cached.slice(0, cached.length - CONFIG.maxCachedPages);
+    for (const p of toEvict) p.nodes = [];   // 占位块仍在，节点交还给 GC
+  }
+
+  /** rAF 节流：根据滚动方向分别做回收 / 补回，避免每帧强制布局 */
+  function scheduleRecycle() {
+    if (state.recycleScheduled || !CONFIG.recycle) return;
+    state.recycleScheduled = true;
+    requestAnimationFrame(() => {
+      state.recycleScheduled = false;
+      if (!CONFIG.recycle || !state.frame || !state.pages.length) return;
+      const y = window.scrollY || window.pageYOffset || 0;
+      const goingDown = y >= state.lastScrollY;
+      state.lastScrollY = y;
+      if (goingDown) recycleAbove();
+      else rehydrateAbove();
+    });
+  }
+
+  /** 向下滚：把整页滑出视口上方的页回收成占位块 */
+  function recycleAbove() {
+    const line = -CONFIG.recycleAbovePx; // 视口顶之上 this px 处为回收线
+    for (const page of state.pages) {
+      if (page.recycled || !page.nodes || !page.nodes.length) continue;
+      const firstNode = page.nodes[0];
+      if (!firstNode.isConnected) continue;
+      // 取这一页最底部节点的下沿，若它都在回收线之上 => 整页已离开视口
+      const lastNode = page.nodes[page.nodes.length - 1];
+      const bottom = lastNode.getBoundingClientRect().bottom;
+      if (bottom < line) {
+        recyclePage(page);
+        maybeEvictCache();
+      } else {
+        break; // 后面的页更靠下，肯定还没离开，停止扫描
+      }
+    }
+  }
+
+  /** 向上滚：把重新进入缓冲距离的占位块补回真实节点 */
+  function rehydrateAbove() {
+    const band = -CONFIG.recycleAbovePx; // 占位块下沿进入该线内即补回
+    for (const page of state.pages) {
+      if (!page.recycled || !page.placeholder || !page.placeholder.isConnected) continue;
+      const r = page.placeholder.getBoundingClientRect();
+      if (r.bottom >= band) rehydratePage(page);
+    }
   }
 
   /* ======================= 页面识别与工具 ======================= */
@@ -416,9 +572,11 @@ html.${HTML_FLAG} .ghsi-item {
       }
 
       // 先让出一帧再动手挂载，别和正在进行的滚动抢主线程
+      state.loadedUrl = url;
       await nextFrame();
       const added = await appendItems(items);
       state.nextUrl = extractNextUrl(doc);
+      if (state.pageMap[state.page]) state.pageMap[state.page].nextUrl = state.nextUrl;
       state.fails = 0;
       state.loading = false;
       if (added > 0) state.burst += 1;   // 只有真的加进了新条目才算这一轮用掉一页
@@ -468,6 +626,7 @@ html.${HTML_FLAG} .ghsi-item {
     }
     if (!pending.length) return 0;
 
+    const nodes = [];
     let added = 0;
     const size = Math.max(1, CONFIG.chunkSize);
     for (let i = 0; i < pending.length; i += size) {
@@ -477,12 +636,33 @@ html.${HTML_FLAG} .ghsi-item {
         node.setAttribute('data-gh-star-page', String(state.page));
         markItem(node);
         frag.appendChild(node);
+        nodes.push(node);
         added += 1;
       }
-      state.frame.appendChild(frag);
+      // 插到哨兵之前，保证哨兵恒定在列表最底部（这样自动加载才能一路触发）
+      if (state.sentinel && state.sentinel.parentNode === state.frame) {
+        state.frame.insertBefore(frag, state.sentinel);
+      } else {
+        state.frame.appendChild(frag);
+      }
       if (i + size < pending.length) await nextFrame();  // 留出渲染机会
     }
-    log('追加', added, '条，累计', state.seen.size);
+
+    // 按页缓存：把这一页的节点整块记下来，供滚动回收 / 回看补回
+    const pageObj = {
+      index: state.page,
+      nodes: nodes,
+      url: state.loadedUrl,     // 这一页当初用的请求 URL（回看重新拉取用）
+      nextUrl: null,            // 解析后由 loadNext 补上
+      realHeight: null,
+      recycled: false,
+      placeholder: null,
+      fetching: false
+    };
+    state.pages.push(pageObj);
+    state.pageMap[state.page] = pageObj;
+
+    log('追加', added, '条（第', state.page, '页），累计', state.seen.size);
     return added;
   }
 
@@ -495,6 +675,7 @@ html.${HTML_FLAG} .ghsi-item {
     if (state.done || state.loading || !state.sentinel || !state.observer) return;
     state.observer.unobserve(state.sentinel);
     state.observer.observe(state.sentinel);
+    scheduleRecycle();   // 新页加载后，顺手把已经滑出上方的旧页回收掉
   }
 
   /** 空闲时提前多取一页，消掉下滑到 Boundary 时的那段"等待期" */
@@ -577,16 +758,37 @@ html.${HTML_FLAG} .ghsi-item {
     state.done = false;
     state.loading = false;
     state.fails = 0;
+    state.pages = [];
+    state.pageMap = {};
+    state.loadedUrl = null;
+    state.lastScrollY = window.scrollY || window.pageYOffset || 0;
 
     // 用页面上已有的条目铺底，避免重复；同时给它们打上优化标记
     // （首页那 30 条同样参与长列表渲染，不标记的话第一屏之后照样卡）
+    const firstNodes = [];
     for (const el of extractItems(frame)) {
       const k = itemKey(el);
       if (!k) continue;
       state.seen.add(k);
       markItem(el);
+      el.setAttribute('data-gh-star-page', '1');   // 与后续加载的页保持一致，方便回收/查询
+      firstNodes.push(el);
     }
     state.nextUrl = extractNextUrl(frame);
+
+    // 首页（第 1 页）同样是"按页缓存"的一部分，方便回看时也能回收/补回
+    const firstPage = {
+      index: 1,
+      nodes: firstNodes,
+      url: location.href,
+      nextUrl: state.nextUrl,
+      realHeight: null,
+      recycled: false,
+      placeholder: null,
+      fetching: false
+    };
+    state.pages.push(firstPage);
+    state.pageMap[1] = firstPage;
 
     document.documentElement.classList.add(HTML_FLAG);
     injectStyle();
@@ -603,6 +805,7 @@ html.${HTML_FLAG} .ghsi-item {
     } else {
       setStatus('idle', '已加载 ' + state.seen.size + ' 个仓库 · 向下滚动加载更多');
     }
+    scheduleRecycle();
     log('已启用 ->', location.href, '| 首页条目', state.seen.size, '| next:', state.nextUrl);
   }
 
@@ -622,10 +825,15 @@ html.${HTML_FLAG} .ghsi-item {
     state.page = 1;
     state.fails = 0;
     state.seen = new Set();
+    state.pages = [];
+    state.pageMap = {};
+    state.loadedUrl = null;
     state.capReleased = false;
     state.prefetching = false;
     state.burst = 0;
     state.burstPaused = false;
+    state.recycleScheduled = false;
+    state.lastScrollY = 0;
   }
 
   function boot() {
@@ -674,6 +882,9 @@ html.${HTML_FLAG} .ghsi-item {
 
   // 用户滚动时解除"一轮加载够了"的暂停（只在暂停时才有动作，平时零开销）
   window.addEventListener('scroll', onUserScroll, { passive: true });
+  // 滚动时做回收 / 回看补回（rAF 节流，按方向分流，平时几乎零开销）
+  window.addEventListener('scroll', scheduleRecycle, { passive: true });
+  window.addEventListener('resize', scheduleRecycle);
 
   boot();
 
@@ -681,6 +892,12 @@ html.${HTML_FLAG} .ghsi-item {
   window.GHStarsInfinite = {
     config: CONFIG,
     state: state,
-    loadMore: () => maybeLoad(true)
+    pages: () => state.pages.map(p => ({
+      index: p.index, recycled: p.recycled,
+      cached: !!(p.nodes && p.nodes.length), count: p.nodes ? p.nodes.length : 0,
+      height: p.realHeight
+    })),
+    loadMore: () => maybeLoad(true),
+    recycleNow: () => { recycleAbove(); }
   };
 })();

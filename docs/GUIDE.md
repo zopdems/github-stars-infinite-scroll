@@ -69,6 +69,7 @@ DOMParser 解析 → 取 turbo-frame → 抽条目 → 按 owner/repo 去重 →
 | `extractNextUrl()` | 从分页区拿下一个游标；拿不到就返回 `null` |
 | `loadNext()` | 单次加载：节流 → 请求 → 解析 → 追加 → 推进游标 / 结束 |
 | `finish()` | 终止：解绑观察、打结束标记、显示"已到底" |
+| `recycleAbove()` / `rehydrateAbove()` / `recyclePage()` / `rehydratePage()` | 滚动回收与回看补回：整页 ↔ 等高占位块 的互换，按页缓存支撑 |
 | `boot()` / `reset()` / `teardown()` | 生命周期，配合 Turbo 无刷新跳转反复启停 |
 | `setStatus()` | 底部状态胶囊（加载中 / 已加载 N 个 / 失败 / 已到底） |
 
@@ -148,11 +149,17 @@ function itemKey(el) {
 const node = document.importNode(el, true);   // 从解析文档克隆，不移动原节点
 node.setAttribute('data-gh-star-page', String(state.page)); // 便于排查/样式
 frag.appendChild(node);
-// 循环结束后一次性挂载
-state.frame.appendChild(frag);
+// 循环结束后一次性挂载（插到哨兵之前，保证哨兵恒定在列表最底部）
+if (state.sentinel && state.sentinel.parentNode === state.frame) {
+  state.frame.insertBefore(frag, state.sentinel);
+} else {
+  state.frame.appendChild(frag);
+}
 ```
 
-只在列表末尾 `appendChild`，**不 `pushState`、不刷新、不替换已有内容**，所以滚动位置天然保持不变。分页按钮靠 CSS 隐藏（见第 7 点），不是删除，避免破坏 GitHub 自身的逻辑。
+> **为什么插到哨兵之前而不是末尾？** 旧写法 `appendChild` 会把新页加到哨兵后面，导致哨兵停在列表半空，滚过它之后 `IntersectionObserver` 再也不会触发，自动加载只能跑一轮。插到哨兵之前让哨兵永远在底部，自动加载才能一路触发到最后一页。
+
+只在列表末尾方向挂载，**不 `pushState`、不刷新、不替换已有内容**，所以滚动位置天然保持不变。分页按钮靠 CSS 隐藏（见第 7 点），不是删除，避免破坏 GitHub 自身的逻辑。
 
 ### 6. 触发：`IntersectionObserver` + 哨兵
 
@@ -195,6 +202,44 @@ window.addEventListener('popstate', () => setTimeout(boot, 60));
 3. 状态条上的「重试」按钮，手动触发
 
 > ⚠️ 一个容易写错的回归点：到底后 `finish()` 会移除哨兵，此时 `MutationObserver` 若据此判断"脚本没初始化"就会重新 `reset()`，把 `done` 清掉，陷入"到底 → 重启 → 再到底"的死循环。脚本里用了一个 `#gh-stars-infinite-end` 结束标记挡住它。
+
+### 9. 滚动回收（v1.3.0）：加载全了之后继续浏览也不卡
+
+`content-visibility`、分块挂载、空闲预取、每轮 3 页把"加载过程"的卡顿压下去了，但**全部加载完之后继续上下翻看**，DOM 里始终堆着上千个条目，滚动仍然发涩、回看偶尔白屏。根因是：那些条目虽然在视口外被跳过绘制，但依然挂在 DOM 树里参与布局计算。
+
+解法：**把视口上方已经翻过去的整页，从 DOM 摘掉换成一块等高占位条；往上回看时再补回**。无论加载多少页，DOM 里始终只保留"视口附近几页"。
+
+```js
+// 向下滚：整页滑出视口上方超过 recycleAbovePx 就回收成占位块
+function recycleAbove() {
+  const line = -CONFIG.recycleAbovePx;
+  for (const page of state.pages) {                 // 按页顺序，只处理顶部的连续前缀
+    if (page.recycled || !page.nodes.length) continue;
+    const lastNode = page.nodes[page.nodes.length - 1];
+    if (lastNode.getBoundingClientRect().bottom < line) {
+      recyclePage(page);                            // 摘节点 + 插等高占位块
+      maybeEvictCache();
+    } else break;                                    // 后面的页更靠下，肯定还没离开，停止扫描
+  }
+}
+
+// 向上滚：占位块重新进入缓冲距离内就补回真实节点
+function rehydrateAbove() {
+  const band = -CONFIG.recycleAbovePx;
+  for (const page of state.pages) {
+    if (!page.recycled || !page.placeholder.isConnected) continue;
+    if (page.placeholder.getBoundingClientRect().bottom >= band) rehydratePage(page);
+  }
+}
+```
+
+三个实现要点：
+
+1. **按页缓存**。`state.pages` 是"第几页 → `{nodes, url, nextUrl, realHeight, recycled, placeholder}`"的有序数组，每次 `appendItems` 把一整页节点整块存进去。回收/补回都是"整页换占位块"的 O(1) 操作，不做逐条 diff。
+2. **占位块等高，滚动不跳变**。`recyclePage` 回收时会测一次该页真实高度（`getBoundingClientRect` 之和，只测一次并缓存）；占位条 `style.height` 与之相等，所以摘掉节点后列表总高不变，滚动位置纹丝不动。`content-visibility: auto` 下离屏节点仍占其固有高度，测量值稳定。
+3. **回看自动补回**。`rehydratePage` 优先用缓存的节点瞬间插回原位；只有当 `maxCachedPages` 把这个页的缓存驱逐了才走网络：`fetchPage(page.url, true)` 用当初这一页的请求 URL 重新拉取并插回（URL 里的 `after` 游标保证拉回来的就是那一页）。
+
+`rAF` 节流 + **按滚动方向分流**：向下滚只做回收、向上滚只做补回，平时几乎零开销。设 `CONFIG.recycle = false` 即可退回"全部常驻 DOM"的旧行为。
 
 ---
 
@@ -261,15 +306,22 @@ const CONFIG = {
   chunkSize: 8,            // 每帧最多挂载几个条目，避免一次性 30 条造成长任务
   prefetchPx: 3000,        // 空闲时提前预取的距离（消掉下滑时的"等待期"）
   maxBurstPages: 3,        // 一轮连续自动加载几页就停（0 = 不限）。停下后滚动或点「继续」再加载下一轮
-  softCap: 0               // 0 = 不限；>0 表示加载到该数量后改为手动点「继续」
+  softCap: 0,              // 0 = 不限；>0 表示加载到该数量后改为手动点「继续」
+
+  /* ---- 滚动回收：解决"加载全了之后继续浏览卡顿" ---- */
+  recycle: true,           // 开启后，视口上方已翻过去的整页会被摘成等高占位块，回看时再补回
+  recycleAbovePx: 1400,    // 整页滑出视口上方超过这个距离（px）就回收；回看时占位块进入该距离内即补回
+  maxCachedPages: 0        // 0=缓存所有已加载页（回看瞬时补回）；>0=只保留最近 N 页节点，更久远的回看会重新拉取
 };
 ```
 
 调试时也可以在控制台直接调用：
 
 ```js
-GHStarsInfinite.loadMore()   // 手动触发一次加载
-GHStarsInfinite.state        // 查看 seen / page / nextUrl / done
+GHStarsInfinite.loadMore()            // 手动触发一次加载
+GHStarsInfinite.state               // 查看 seen / page / nextUrl / done / pages
+GHStarsInfinite.pages()             // 一览每页：是否已回收、缓存是否在、节点数、高度
+GHStarsInfinite.recycleNow()        // 立刻执行一次"回收上方整页"
 GHStarsInfinite.config.debug = true
 ```
 
@@ -421,3 +473,12 @@ function onUserScroll() {
 - 点「继续」按钮 → 立即加载一页（240）并解除暂停
 - `maxBurstPages = 0` 时 5 次触发全部加载，不会暂停
 - 手动/重试走 `force` 路径，不被每轮上限挡住
+
+**滚动回收（v1.3.0，20 项断言全过，`test-recycle.js`，jsdom 注入真实脚本 + 可控布局/滚动）**
+
+- 首页（第 1 页）启动即进入按页缓存；再加载一页后共 2 页、各 5 节点均在 DOM
+- 把第 1 页推到视口上方并触发回收：节点从 DOM 摘除、出现 `.ghsi-pholder[data-gh-page="1"]` 占位块、占位块高度 = 5×100 = 500px、第 2 页未被误回收
+- 往上回看（占位块进入缓冲距离内）：第 1 页节点从缓存补回、占位块移除、回收标记清除
+- `maxCachedPages = 1` 下加载 4 页并全部回收：只保留最新 1 页节点，第 1~3 页缓存被驱逐
+- 回看被驱逐的第 1 页：触发网络重新拉取（含首页 URL）、节点补回、占位块移除
+- 回归：哨兵恒定在列表最底部（修复旧 `appendChild` 导致自动加载只能跑一轮的问题）
