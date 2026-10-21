@@ -1,16 +1,18 @@
-# GitHub Stars 无限滚动 —— 技术指南
+# GitHub Stars / 仓库 无限滚动 —— 技术指南
 
-一份给 GitHub 用户 Stars 标签页加"无限滚动"的用户脚本（Tampermonkey / Violentmonkey）。
+一份给 GitHub 用户 **Stars** 和 **仓库（Repositories）** 两个标签页加"无限滚动"的用户脚本（Tampermonkey / Violentmonkey）。
 
 - **脚本文件**：`github-stars-infinite-scroll.user.js`
-- **适用范围**：任意用户的 Stars 页（`https://github.com/{任意用户名}?tab=stars`），不限于某个账号
+- **适用范围**：任意用户的 `?tab=stars` 和 `?tab=repositories` 页（`https://github.com/{任意用户名}?tab=…`），不限于某个账号
 - **依赖**：无。纯浏览器端，不改 GitHub 的 DOM 结构之外的任何东西，不需要服务器、不需要 Token
 
 ---
 
-## 一、先说结论：GitHub 现在的 Stars 分页长什么样
+## 一、先说结论：两个标签页的分页长什么样
 
-这一节是整份脚本的地基。所有结论都来自对线上页面的**实际抓取验证**（2026-10），不是猜的。
+这一节是整份脚本的地基。所有结论都来自对线上页面的**实际抓取验证**（2026-10），不是猜的。关键点：**两个标签页的分页机制不一样**。
+
+### Stars（`?tab=stars`）—— 游标分页
 
 | # | 结论 | 验证方式 / 影响 |
 |---|------|----------------|
@@ -32,30 +34,56 @@
 > </div>
 > ```
 
+### 仓库（`?tab=repositories`，含 `&type=source`）—— 经典页码分页
+
+| # | 结论 | 验证方式 / 影响 |
+|---|------|----------------|
+| 1 | **分页是经典的 `?page=N&tab=repositories`** | Next 链接是 `a.next_page[rel="next"]`，href 形如 `/{user}?page=2&tab=repositories`。与 Stars 相反，`?page=2` **有效** |
+| 2 | 列表容器是 `<turbo-frame id="user-profile-frame">` | 整个 profile 都在这个帧里；仓库条目是 `ul > li.col-12 … border-bottom`，**在 `<ul>` 中、不是帧的直接子元素** |
+| 3 | 每个条目的仓库名链接是 `h3 > a[itemprop="name codeRepository"][href="/{owner}/{repo}"]` | 同一 `li` 里还有 `stargazers` / `forks` 等三段路径链接，靠 `itemKey` 只认 `h3` 里的仓库名链接，不会误当成条目 key |
+| 4 | 请求带 `Turbo-Frame: user-profile-frame` 头同样只返回帧片段 | 实测 400KB → 270KB |
+| 5 | Next 链接 href 会带上当前过滤参数（`type=source` / `sort` / `q`） | 复用 href 即自动保留过滤条件 |
+| 6 | **最后一页的 `.paginate-container` 里没有 `next_page` 链接** | 终止信号与 Stars 同理（拿不到 Next ⇒ `null`） |
+
+> 仓库页分页区真实结构（已脱敏）：
+> ```html
+> <div class="paginate-container">
+>   <div role="navigation" aria-label="Pagination" class="pagination">
+>     <span class="previous_page disabled">Previous</span>
+>     <a class="next_page" rel="next" href="/sindresorhus?page=2&amp;tab=repositories&amp;type=source">Next</a>
+>   </div>
+> </div>
+> ```
+
+**统一做法**：下一页地址一律复用分页区 Next 链接的 `href`，因此游标 / 页码两套机制都不用自己拼；容器、条目选择器、追加容器、占位块标签按 `tab` 在 `TABS` 里分流（见第二节）。
+
 ---
 
 ## 二、实现思路
 
-整体是一条"**取游标 → 请求 → 解析 → 追加 → 取新游标**"的循环，靠 `IntersectionObserver` 触发：
+整体是一条"**取下一页地址 → 请求 → 解析 → 追加 → 再取下一页地址**"的循环，靠 `IntersectionObserver` 触发：
 
 ```
-URL 是 /{user}?tab=stars ?
-        │ 否 → 不启用（并清理残留）
+URL 是 /{user}?tab=stars 或 ?tab=repositories ?
+        │ 都不是 → 不启用（并清理残留）
         ▼
-找到 turbo-frame#user-starred-repos
+activeTab() 判定 → 取 TABS[tab]：帧 id / 条目选择器 / 追加容器模式 / 占位块标签
         ▼
-用页面上已有的 30 条铺底 → seen 集合（去重基线）
-从分页区取出第一个游标 → nextUrl
-插入哨兵 <div> 到列表末尾 + 插入状态胶囊
+找到对应 turbo-frame（Stars=#user-starred-repos，仓库=#user-profile-frame）
+        ▼
+用页面上已有的条目铺底 → seen 集合（去重基线）
+从分页区取出下一页地址 → nextUrl（游标 or 页码，随标签页而定）
+插入哨兵 <div> 到帧末尾 + 插入状态胶囊
         ▼
 IntersectionObserver 监听哨兵（rootMargin 900px 预加载）
         │ 哨兵进入视口
         ▼
-fetch(nextUrl, { Turbo-Frame: user-starred-repos })
+fetch(nextUrl, { Turbo-Frame: <帧id> })
         ▼
-DOMParser 解析 → 取 turbo-frame → 抽条目 → 按 owner/repo 去重 → appendChild
+DOMParser 解析 → 取 turbo-frame → 抽条目 → 按 owner/repo 去重
+        → 追加到列表容器（Stars=帧本身，仓库=条目所在的 <ul>）
         ▼
-从新文档取下一个游标
+从新文档取下一页地址
    ├─ 有  → 更新 nextUrl，回到监听
    └─ 无  → finish()：停止请求 + 显示"已到底"
 ```
@@ -64,13 +92,14 @@ DOMParser 解析 → 取 turbo-frame → 抽条目 → 按 owner/repo 去重 →
 
 | 模块 | 职责 |
 |------|------|
-| `isStarsPage()` | 页面识别：单段路径 + `tab=stars` + 排除 GitHub 保留路径（`/topics`、`/marketplace`…） |
-| `findFrame()` / `extractItems()` / `itemKey()` | DOM 抽取，带三级降级选择器 |
-| `extractNextUrl()` | 从分页区拿下一个游标；拿不到就返回 `null` |
-| `loadNext()` | 单次加载：节流 → 请求 → 解析 → 追加 → 推进游标 / 结束 |
+| `activeTab()` | 页面识别：单段路径 + `tab` ∈ {stars, repositories} + 排除 GitHub 保留路径（`/topics`、`/marketplace`…） |
+| `TABS` | 按标签页配置：`frameId` / `itemSelectors` / `listMode`（追加容器是帧还是 `<ul>`）/ `placeholderTag`（占位块是 div 还是 li） |
+| `findFrame()` / `extractItems()` / `itemKey()` | DOM 抽取；选择器按当前 `TABS[state.tab]` 取，`itemKey` 只认 `h3` 里的仓库名链接 |
+| `extractNextUrl()` | 从分页区拿下一页地址（游标 / 页码通用）；拿不到就返回 `null` |
+| `loadNext()` | 单次加载：节流 → 请求 → 解析 → 追加 → 推进 / 结束 |
 | `finish()` | 终止：解绑观察、打结束标记、显示"已到底" |
 | `recycleAbove()` / `rehydrateAbove()` / `recyclePage()` / `rehydratePage()` | 滚动回收与回看补回：整页 ↔ 等高占位块 的互换，按页缓存支撑 |
-| `boot()` / `reset()` / `teardown()` | 生命周期，配合 Turbo 无刷新跳转反复启停 |
+| `boot()` / `reset()` / `teardown()` | 生命周期，配合 Turbo 无刷新跳转、在两个标签页间切换时反复启停 |
 | `setStatus()` | 底部状态胶囊（加载中 / 已加载 N 个 / 失败 / 已到底） |
 
 ---
@@ -194,7 +223,7 @@ window.addEventListener('popstate', () => setTimeout(boot, 60));
 // 外加一个 250ms 去抖的 MutationObserver 兜底（切排序、Turbo 换帧内容等场景）
 ```
 
-`boot()` 每次都会重新判断"当前是不是 Stars 页"，不是就 `teardown()` 清理干净；是就用新的游标重新初始化。
+`boot()` 每次都会用 `activeTab()` 重新判断"当前是不是受支持的标签页（Stars / 仓库）"，不是就 `teardown()` 清理干净；是就按对应 `TABS[tab]` 重新初始化。在 Stars ↔ 仓库 ↔ 其它标签页之间切换时，`activeTab()` 返回值变化会触发重新初始化或清理。
 
 **失败重试**分三层：
 1. 自动退避重试 `maxRetry = 3` 次，间隔 `1500ms × 失败次数`
@@ -241,6 +270,36 @@ function rehydrateAbove() {
 
 `rAF` 节流 + **按滚动方向分流**：向下滚只做回收、向上滚只做补回，平时几乎零开销。设 `CONFIG.recycle = false` 即可退回"全部常驻 DOM"的旧行为。
 
+### 10. 一套脚本吃两个标签页（v1.4.0）：Stars + 仓库
+
+Stars 和仓库两个标签页的分页机制、容器、条目结构都不同，用一张 `TABS` 表按 `tab` 参数分流，其余逻辑（加载 / 去重 / 回收 / 补回 / 重试）完全复用：
+
+```js
+const TABS = {
+  stars: {
+    frameId: 'user-starred-repos',
+    itemSelectors: ['div[class*="col-12"][class*="border-bottom"]', …],
+    listMode: 'frame',      // 追加容器 = 帧本身
+    placeholderTag: 'div'
+  },
+  repositories: {
+    frameId: 'user-profile-frame',
+    itemSelectors: ['li[class*="col-12"][class*="border-bottom"]', …],
+    listMode: 'list',       // 追加容器 = 条目所在的 <ul>
+    placeholderTag: 'li'    // 占位块用 <li>，保持 <ul> 结构合法
+  }
+};
+```
+
+四个必须跟着标签页走的东西：
+
+1. **帧 id**（`state.frameId`）：Stars=`user-starred-repos`，仓库=`user-profile-frame`。`fetchPage` 的 `Turbo-Frame` 头、`findFrame` 都用它。
+2. **条目选择器**（`extractItems` 按 `TABS[state.tab]` 取）：Stars 是 `div`，仓库是 `li`。`itemKey` 只认 `h3` 里的仓库名链接，所以仓库条目里的 `stargazers` / `forks` 三段路径链接不会被误当成 key。
+3. **追加容器**（`state.list`）：仓库的 `li` 在一个 `<ul>` 里，不能往帧上直接 `appendChild`（会掉到 `<ul>` 外面破坏布局）。`reset()` 里取"第一个条目的父元素"，是 `UL/OL` 就用作追加容器，否则退回帧本身。
+4. **占位块标签**（`state.placeholderTag`）：仓库页回收出来的占位块得是 `<li>` 才能待在 `<ul>` 里；用 `<div>` 会破坏列表语义。CSS 里给 `.ghsi-pholder` 重置了 `list-style/margin/padding`，作为 `<li>` 也干净。
+
+下一页地址两套机制通用：**一律复用 Next 链接 href**（Stars 的 `after` 游标、仓库的 `page=N` 都带上当前排序/过滤参数），所以 `extractNextUrl` 不用改，`type=source` 之类的过滤条件也自动保留。
+
 ---
 
 ## 四、安装使用
@@ -268,17 +327,18 @@ function rehydrateAbove() {
 
 ### 3. 用
 
-打开任意用户的 Stars 页，例如：
+打开任意用户的 Stars 或 仓库 页，例如：
 
 ```
 https://github.com/zopdems?tab=stars
-https://github.com/torvalds?tab=stars
+https://github.com/zopdems?tab=repositories        # 加 &type=source 只看非 fork
 ```
 
 - 向下滚动 → 自动加载，页面不跳转、滚动位置不变
 - 底部胶囊显示进度；滚到底显示 **「已到底 · 共 N 个仓库 / M 页」**
 - 网络出错时胶囊变红，滚动一下或点「重试」
-- 从其他页面点进 Stars 页（Turbo 无刷新跳转）同样生效
+- 从其他页面点进这两个标签页（Turbo 无刷新跳转）同样生效
+- 想看**自己的**仓库，用个人主页的 `?tab=repositories`；登录后的仪表盘 `/?tab=repositories` 是另一套布局，本版本不覆盖
 
 ### 4. 卸载 / 临时关闭
 
@@ -292,7 +352,7 @@ https://github.com/torvalds?tab=stars
 
 ```js
 const CONFIG = {
-  frameId: 'user-starred-repos', // Stars 列表所在的 turbo-frame id
+  // frameId / 条目选择器 / 追加容器 / 占位块标签 现按标签页在上方 TABS 里配置（Stars 与 仓库 各一套）
   preloadPx: 900,                // 距底部多少像素开始预加载（想更"跟手"就调大）
   minIntervalMs: 350,            // 两次请求最小间隔，防止风控
   maxRetry: 3,                   // 同一页自动重试次数
@@ -482,3 +542,23 @@ function onUserScroll() {
 - `maxCachedPages = 1` 下加载 4 页并全部回收：只保留最新 1 页节点，第 1~3 页缓存被驱逐
 - 回看被驱逐的第 1 页：触发网络重新拉取（含首页 URL）、节点补回、占位块移除
 - 回归：哨兵恒定在列表最底部（修复旧 `appendChild` 导致自动加载只能跑一轮的问题）
+
+**仓库标签页（v1.4.0，`test-repos.js` 21 项断言全过 + 真实页面复验）**
+
+合成页（结构对齐实测：`#user-profile-frame > div > ul > li` + `.paginate-container`，`?page=N`）：
+
+- `activeTab = repositories`、`frameId = user-profile-frame`、追加容器是 `<ul>`、占位块标签是 `<li>`
+- 首页 3 个 `<li>` 铺底；加载第 2 页后 3 个新 `<li>` **追加进同一个 `<ul>`**（不在帧直属层），`nextUrl` 指向 `page=3`
+- 哨兵仍在帧内、位于内容之后（保证一路触发）
+- 回收第 1 页：`<li>` 摘除、`<ul>` 内出现 `<li class="ghsi-pholder">` 且高度 = 3×160 = 480px、第 2 页未误回收
+- 回看补回（缓存命中）：`<li>` 补回 `<ul>`、占位块移除
+- 一路加载到最后一页（无 `next_page`）→ `done = true`、去重 = 5×3 = 15、结束标记入帧、到底后 `loadMore` 不再发请求
+
+真实页面复验（curl 抓 sindresorhus 第 1/2 页，jsdom 注入脚本）：
+
+- 首页解析出 **30** 个 `<li>`，key 全是干净的 `owner/repo`（**没有**把 `stargazers` / `forks` 三段路径链接当成 key）
+- `nextUrl` = `?page=2&tab=repositories`；加载第 2 页后累计 60、DOM 多出 30 个真实仓库、下一跳 `page=3`
+- 带 `Turbo-Frame: user-profile-frame` 头确只返回帧片段（400KB → 270KB）
+- 回归：重构后 **Stars 页对真实 HTML 依然正常**（`activeTab=stars`、30 条铺底、`after` 游标、加载第 2 页后 60 条）
+
+> ⚠️ 抓取踩坑（与脚本无关）：本机 curl 带 `Turbo-Frame` 头抓 Stars 第 2 页时，偶发返回一个标题为 "American Airlines" 的无关页面（疑似网络/CDN 干扰）。脚本对"解析不到条目"的情况会**安全停止**而不是死循环，正好兜住了这种脏数据。

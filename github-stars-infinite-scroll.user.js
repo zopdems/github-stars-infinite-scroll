@@ -2,8 +2,8 @@
 // @name         GitHub Stars 无限滚动
 // @name:zh-CN   GitHub Stars 无限滚动
 // @namespace    https://github.com/
-// @version      1.3.0
-// @description  在任意 GitHub 用户的 Stars 标签页实现无限滚动：滚动接近底部自动加载下一页并追加到列表末尾，隐藏原生分页按钮，加载完给出「已到底」提示，失败后滚动即可重试；支持滚动回收——把视口上方已浏览的整页换成等高占位块，回看时再补回，长列表（几百上千个星标）不再卡顿。
+// @version      1.4.0
+// @description  在任意 GitHub 用户的「Stars」和「仓库 / Repositories」标签页实现无限滚动：滚动接近底部自动加载下一页并追加到列表末尾，隐藏原生分页按钮，加载完给出「已到底」提示，失败后滚动即可重试；支持滚动回收——把视口上方已浏览的整页换成等高占位块，回看时再补回，长列表不再卡顿。
 // @author       zopdems
 // @license      MIT
 // @homepageURL  https://github.com/zopdems/github-stars-infinite-scroll
@@ -18,18 +18,32 @@
 
 /*
  * ──────────────────────────────────────────────────────────────
- *  GitHub Stars 无限滚动
+ *  GitHub 列表无限滚动（Stars + 仓库 / Repositories）
  *
- *  实测（2026-10）GitHub Stars 标签页的真实行为：
+ *  实测（2026-10）GitHub 两个标签页的真实行为：
+ *
+ *  ★ Stars 标签页 /{user}?tab=stars
  *   1. 分页不是 ?page=N，而是游标 ?after=<cursor>&tab=stars
  *      —— 实测 ?page=2 返回的是第一页，完全无效。
  *   2. 下一页地址必须取自分页区 "Next" 链接的 href，
  *      它会同时带上排序参数（user_lists_sort / direction）。
  *   3. 仓库列表位于 <turbo-frame id="user-starred-repos">，
- *      每个条目是它的直接子元素 div.col-12 ... border-bottom。
+ *      每个条目是它的后代 div.col-12 ... border-bottom。
  *   4. 请求时带 Turbo-Frame: user-starred-repos 请求头，
  *      GitHub 会只返回该帧的 HTML 片段（约 193KB，整页是 328KB）。
  *   5. 最后一页根本没有 .paginate-container —— 这就是终止信号。
+ *
+ *  ★ 仓库标签页 /{user}?tab=repositories（含 &type=source 等过滤）
+ *   1. 分页是经典的 ?page=N&tab=repositories（Next 链接 a.next_page[rel=next]）。
+ *      —— 注意：仓库页与 Stars 相反，?page=2 是有效的。
+ *   2. 列表位于 <turbo-frame id="user-profile-frame">（整个 profile 都在这个帧里），
+ *      条目是 ul > li.col-12 ... border-bottom（在 <ul> 中，不是帧的直接子元素）。
+ *   3. Next 链接 href 会带上当前过滤参数（type=source / sort / q 等），复用即自动保留。
+ *   4. 带 Turbo-Frame: user-profile-frame 请求头同样只返回帧片段（400KB → 270KB）。
+ *   5. 最后一页的 .paginate-container 里没有 next_page 链接 —— 终止信号同上。
+ *
+ *  下一页 URL 一律复用分页区 Next 链接的 href，因此两套分页机制都能正确处理，
+ *  排序/过滤参数也自动带上。容器、条目选择器、占位块标签按 tab 在 TABS 里分流。
  * ──────────────────────────────────────────────────────────────
  */
 
@@ -38,7 +52,7 @@
 
   /* ============================ 配置 ============================ */
   const CONFIG = {
-    frameId: 'user-starred-repos', // Stars 列表所在的 turbo-frame id
+    // frameId / 条目选择器 / 占位块标签 现按标签页在下方 TABS 里配置（Stars 与 仓库 各一套）
     preloadPx: 900,                // 距底部还有多少像素就开始预加载
     minIntervalMs: 350,            // 两次请求的最小间隔（ms），防抖/防风控
     maxRetry: 3,                   // 同一页自动重试次数
@@ -71,6 +85,38 @@
     'users', 'watching'
   ]);
 
+  /* ======================= 标签页配置（Stars / 仓库） =======================
+   * 两个标签页的容器、条目选择器、追加容器、占位块标签都不同，按 tab 参数分流：
+   *   - Stars：      turbo-frame#user-starred-repos，条目 div.col-12…border-bottom，
+   *                  追加容器就是帧本身，游标分页 ?after=<cursor>。
+   *   - 仓库：       turbo-frame#user-profile-frame，条目 ul > li.col-12…border-bottom，
+   *                  追加容器是条目所在的 <ul>，经典分页 ?page=N。
+   * 下一页 URL 一律复用分页区 Next 链接 href，排序/过滤参数（type=source 等）自动带上。
+   * ======================================================================== */
+  const TABS = {
+    stars: {
+      frameId: 'user-starred-repos',
+      itemSelectors: [
+        'div[class*="col-12"][class*="border-bottom"]',
+        'div[class*="border-bottom"]',
+        'div[class*="width-full"]'
+      ],
+      listMode: 'frame',      // 追加容器 = turbo-frame 本身
+      placeholderTag: 'div'   // 回收占位块用 <div>
+    },
+    repositories: {
+      frameId: 'user-profile-frame',
+      itemSelectors: [
+        'li[class*="col-12"][class*="border-bottom"]',
+        'li[class*="col-12"][class*="flex-justify-between"]',
+        'li[class*="col-12"]'
+      ],
+      listMode: 'list',       // 追加容器 = 条目所在的 <ul>
+      placeholderTag: 'li'    // 回收占位块用 <li>（保持 <ul> 结构合法）
+    }
+  };
+  const FALLBACK_ITEM_SELECTORS = TABS.stars.itemSelectors; // state.tab 未定时兜底
+
   const REPO_PATH = /^\/([^/]+)\/([^/]+)\/?$/;
   const STYLE_ID = 'gh-stars-infinite-style';
   const SENTINEL_ID = 'gh-stars-infinite-sentinel';
@@ -83,7 +129,11 @@
 
   /* ============================ 状态 ============================ */
   const state = {
+    tab: null,              // 当前标签页：'stars' | 'repositories'
     frame: null,
+    frameId: null,          // 当前标签页的 turbo-frame id（来自 TABS）
+    list: null,             // 追加/回收的容器：Stars=帧本身，仓库=条目所在的 <ul>
+    placeholderTag: 'div',  // 回收占位块的标签：Stars=div，仓库=li
     sentinel: null,
     endMarker: null,
     statusEl: null,
@@ -151,11 +201,11 @@
       page.realHeight = h || CONFIG.itemHeight * page.nodes.length;
     }
 
-    const ph = document.createElement('div');
+    const ph = document.createElement(state.placeholderTag || 'div');
     ph.className = 'ghsi-pholder';
     ph.style.height = page.realHeight + 'px';
     ph.dataset.ghPage = String(page.index);
-    state.frame.insertBefore(ph, nextSib);
+    state.list.insertBefore(ph, nextSib);
     page.nodes.forEach(n => n.remove());
     page.placeholder = ph;
     page.recycled = true;
@@ -172,7 +222,7 @@
       const nextSib = ph.nextSibling;
       const frag = document.createDocumentFragment();
       for (const n of page.nodes) frag.appendChild(n);
-      state.frame.insertBefore(frag, nextSib);
+      state.list.insertBefore(frag, nextSib);
       ph.remove();
       page.placeholder = null;
       page.recycled = false;
@@ -186,7 +236,7 @@
   async function rehydratePageAsync(page) {
     if (page.fetching) return;
     page.fetching = true;
-    const ph = state.frame.querySelector('.ghsi-pholder[data-gh-page="' + page.index + '"]');
+    const ph = state.list.querySelector('.ghsi-pholder[data-gh-page="' + page.index + '"]');
     try {
       if (!ph) { page.fetching = false; return; }
       const html = await fetchPage(page.url, true);
@@ -206,8 +256,8 @@
       if (!nodes.length) { page.fetching = false; return; }
       const frag = document.createDocumentFragment();
       for (const n of nodes) frag.appendChild(n);
-      const phNow = state.frame.querySelector('.ghsi-pholder[data-gh-page="' + page.index + '"]');
-      if (phNow) state.frame.insertBefore(frag, phNow.nextSibling);
+      const phNow = state.list.querySelector('.ghsi-pholder[data-gh-page="' + page.index + '"]');
+      if (phNow) state.list.insertBefore(frag, phNow.nextSibling);
       if (phNow) phNow.remove();
       page.placeholder = null;
       page.recycled = false;
@@ -275,19 +325,22 @@
 
   /* ======================= 页面识别与工具 ======================= */
 
-  /** 当前是否是某个用户的 Stars 标签页（对任意用户名生效） */
-  function isStarsPage() {
-    if (location.hostname !== 'github.com') return false;
-    if (new URLSearchParams(location.search).get('tab') !== 'stars') return false;
+  /** 当前处于哪个受支持的标签页：'stars' | 'repositories' | null（对任意用户名生效） */
+  function activeTab() {
+    if (location.hostname !== 'github.com') return null;
+    const tab = new URLSearchParams(location.search).get('tab');
+    if (tab !== 'stars' && tab !== 'repositories') return null;
     const seg = location.pathname.split('/').filter(Boolean);
-    if (seg.length !== 1) return false;              // 只认 /{user} 这种单段路径
-    return !RESERVED.has(seg[0].toLowerCase());
+    if (seg.length !== 1) return null;               // 只认 /{user} 这种单段路径
+    if (RESERVED.has(seg[0].toLowerCase())) return null;
+    return tab;
   }
 
-  /** 取列表容器：优先 turbo-frame#user-starred-repos，逐级降级 */
+  /** 取列表容器：优先当前标签页的 turbo-frame，逐级降级 */
   function findFrame(doc) {
-    return doc.getElementById(CONFIG.frameId) ||
-           doc.querySelector('turbo-frame#' + CONFIG.frameId) ||
+    const id = state.frameId;
+    return (id && doc.getElementById(id)) ||
+           (id && doc.querySelector('turbo-frame#' + id)) ||
            doc.querySelector('main') ||
            doc.body;
   }
@@ -308,19 +361,14 @@
   }
 
   /**
-   * 从容器里抽出仓库条目。
-   * 注意：条目外层有一层 wrapper，不能直接取 frame.children
-   * （那样会把整个 wrapper 当成一个条目），必须深度查找后再
+   * 从容器里抽出仓库条目（选择器按当前标签页取）。
+   * 注意：条目外层可能还有 wrapper，不能直接取 frame.children
+   * （会把 wrapper 当成一个条目），必须深度查找后再
    * 剔除「包含其它候选元素」的父级，只保留最内层的条目节点。
    */
-  const ITEM_SELECTORS = [
-    'div[class*="col-12"][class*="border-bottom"]',
-    'div[class*="border-bottom"]',
-    'div[class*="width-full"]'
-  ];
-
   function extractItems(frame) {
-    for (const sel of ITEM_SELECTORS) {
+    const sels = (state.tab && TABS[state.tab]) ? TABS[state.tab].itemSelectors : FALLBACK_ITEM_SELECTORS;
+    for (const sel of sels) {
       const cands = Array.from(frame.querySelectorAll(sel)).filter(el => itemKey(el));
       const top = cands.filter(el => !cands.some(o => o !== el && o.contains(el)));
       if (top.length) return top;
@@ -353,12 +401,16 @@
   function injectStyle() {
     if (document.getElementById(STYLE_ID)) return;
     const css = `
-/* 1) 隐藏原生分页按钮（只作用于 Stars 列表所在区域） */
+/* 1) 隐藏原生分页按钮（Stars 与 仓库 两个标签页都适用） */
 html.${HTML_FLAG} main .paginate-container,
 html.${HTML_FLAG} main [data-test-selector="pagination"] { display: none !important; }
 
 /* 2) 触发哨兵 */
 #${SENTINEL_ID} { height: 1px; width: 100%; }
+
+/* 2.4) 滚动回收占位块：高度由 JS 按该页真实高度内联设置；
+   这里重置列表样式，保证作为 <li>（仓库页的 <ul> 内）也干净、不冒项目符号。 */
+.ghsi-pholder { list-style: none !important; margin: 0 !important; padding: 0 !important; box-sizing: border-box; }
 
 /* 2.5) 长列表性能：视口外的条目跳过布局与绘制。
    条目真实渲染过一次后浏览器会记住实际高度（auto 关键字），
@@ -464,7 +516,7 @@ html.${HTML_FLAG} .ghsi-item {
       'Accept': 'text/html,application/xhtml+xml',
       'X-Requested-With': 'XMLHttpRequest'
     };
-    if (useTurboFrame) headers['Turbo-Frame'] = CONFIG.frameId;
+    if (useTurboFrame && state.frameId) headers['Turbo-Frame'] = state.frameId;
     const res = await fetch(url, {
       method: 'GET',
       headers: headers,
@@ -639,11 +691,13 @@ html.${HTML_FLAG} .ghsi-item {
         nodes.push(node);
         added += 1;
       }
-      // 插到哨兵之前，保证哨兵恒定在列表最底部（这样自动加载才能一路触发）
-      if (state.sentinel && state.sentinel.parentNode === state.frame) {
-        state.frame.insertBefore(frag, state.sentinel);
+      // 追加到列表容器（Stars=帧本身，仓库=条目所在的 <ul>）。
+      // 若哨兵就在同一容器里，插到哨兵之前，保证哨兵恒定在最底部（自动加载才能一路触发）。
+      const target = state.list;
+      if (state.sentinel && state.sentinel.parentNode === target) {
+        target.insertBefore(frag, state.sentinel);
       } else {
-        state.frame.appendChild(frag);
+        target.appendChild(frag);
       }
       if (i + size < pending.length) await nextFrame();  // 留出渲染机会
     }
@@ -749,9 +803,13 @@ html.${HTML_FLAG} .ghsi-item {
     return s;
   }
 
-  function reset(frame) {
+  function reset(frame, tab) {
     teardown(false);
 
+    const cfg = TABS[tab] || TABS.stars;
+    state.tab = tab;
+    state.frameId = cfg.frameId;
+    state.placeholderTag = cfg.placeholderTag;
     state.frame = frame;
     state.seen = new Set();
     state.page = 1;
@@ -774,6 +832,16 @@ html.${HTML_FLAG} .ghsi-item {
       el.setAttribute('data-gh-star-page', '1');   // 与后续加载的页保持一致，方便回收/查询
       firstNodes.push(el);
     }
+
+    // 追加/回收容器：仓库页的条目在一个 <ul> 里（不是帧的直接子元素），
+    // 要找到那个 <ul>；Stars 页条目就在帧里，直接用帧本身。
+    if (cfg.listMode === 'list' && firstNodes.length) {
+      const p = firstNodes[0].parentElement;
+      state.list = (p && /^(UL|OL)$/.test(p.tagName)) ? p : frame;
+    } else {
+      state.list = frame;
+    }
+
     state.nextUrl = extractNextUrl(frame);
 
     // 首页（第 1 页）同样是"按页缓存"的一部分，方便回看时也能回收/补回
@@ -806,7 +874,7 @@ html.${HTML_FLAG} .ghsi-item {
       setStatus('idle', '已加载 ' + state.seen.size + ' 个仓库 · 向下滚动加载更多');
     }
     scheduleRecycle();
-    log('已启用 ->', location.href, '| 首页条目', state.seen.size, '| next:', state.nextUrl);
+    log('已启用[' + tab + '] ->', location.href, '| 首页条目', state.seen.size, '| list:', state.list && state.list.tagName, '| next:', state.nextUrl);
   }
 
   function teardown(full) {
@@ -817,7 +885,11 @@ html.${HTML_FLAG} .ghsi-item {
     if (state.statusEl) { try { state.statusEl.remove(); } catch (e) { /* ignore */ } state.statusEl = null; }
     if (state.scheduled) { clearTimeout(state.scheduled); state.scheduled = null; }
     if (full) document.documentElement.classList.remove(HTML_FLAG);
+    state.tab = null;
     state.frame = null;
+    state.frameId = null;
+    state.list = null;
+    state.placeholderTag = 'div';
     state.endMarker = null;
     state.nextUrl = null;
     state.loading = false;
@@ -837,10 +909,13 @@ html.${HTML_FLAG} .ghsi-item {
   }
 
   function boot() {
-    if (!isStarsPage()) { teardown(true); return; }
+    const tab = activeTab();
+    if (!tab) { teardown(true); return; }
+    state.tab = tab;   // 先设好，extractItems 才会用对选择器
 
-    const frame = document.getElementById(CONFIG.frameId) ||
-                  document.querySelector('turbo-frame#' + CONFIG.frameId);
+    const frameId = TABS[tab].frameId;
+    const frame = document.getElementById(frameId) ||
+                  document.querySelector('turbo-frame#' + frameId);
     if (!frame) { teardown(true); return; }
 
     // 已经初始化过：哨兵还在（内容没被 Turbo 换掉）-> 不动
@@ -850,11 +925,11 @@ html.${HTML_FLAG} .ghsi-item {
 
     // 内容还没渲染完（条目为 0 且也不是明确的空状态）-> 等下一次变化
     const hasItems = extractItems(frame).length > 0;
-    const emptyState = /hasn't starred|doesn't have any starred|no starred|haven't starred/i
+    const emptyState = /hasn't starred|doesn't have any starred|no starred|haven't starred|any public repositories|doesn't have any repositories|no repositories yet/i
       .test(frame.textContent || '');
     if (!hasItems && !emptyState) return;
 
-    reset(frame);
+    reset(frame, tab);
   }
 
   /* ===================== Turbo / 导航兼容 ===================== */
@@ -872,7 +947,7 @@ html.${HTML_FLAG} .ghsi-item {
     if (state.moTimer) return;
     state.moTimer = setTimeout(() => {
       state.moTimer = null;
-      if (!isStarsPage()) { if (state.frame) teardown(true); return; }
+      if (!activeTab()) { if (state.frame) teardown(true); return; }
       if (state.frame && state.sentinel && state.frame.contains(state.sentinel)) return;
       if (state.frame && state.endMarker && state.frame.contains(state.endMarker)) return;
       boot();
@@ -891,7 +966,9 @@ html.${HTML_FLAG} .ghsi-item {
   // 方便在控制台排查 / 手动触发
   window.GHStarsInfinite = {
     config: CONFIG,
+    tabs: TABS,
     state: state,
+    activeTab: () => state.tab,
     pages: () => state.pages.map(p => ({
       index: p.index, recycled: p.recycled,
       cached: !!(p.nodes && p.nodes.length), count: p.nodes ? p.nodes.length : 0,

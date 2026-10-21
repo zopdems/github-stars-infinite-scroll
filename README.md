@@ -1,11 +1,14 @@
-# GitHub Stars 无限滚动
+# GitHub Stars / 仓库 无限滚动
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Userscript](https://img.shields.io/badge/Tampermonkey%20%2F%20Violentmonkey-✓-blue.svg)](https://www.tampermonkey.net/)
 
-给 GitHub 用户的 **Stars 标签页** 加「无限滚动」：向下滚动自动加载下一页并追加到列表末尾，不用点 Next，页面不刷新、不跳转、滚动位置不变，到底给出提示。
+给 GitHub 用户的 **Stars** 和 **仓库（Repositories）** 两个标签页加「无限滚动」：向下滚动自动加载下一页并追加到列表末尾，不用点 Next，页面不刷新、不跳转、滚动位置不变，到底给出提示。
 
-适用于**任意用户**的 `https://github.com/{用户名}?tab=stars`。
+适用于**任意用户**的：
+
+- `https://github.com/{用户名}?tab=stars`（星标列表）
+- `https://github.com/{用户名}?tab=repositories`（仓库列表，含 `&type=source` 等过滤）
 
 - 📜 脚本：[`github-stars-infinite-scroll.user.js`](github-stars-infinite-scroll.user.js)
 - 📖 技术指南：[`docs/GUIDE.md`](docs/GUIDE.md)
@@ -14,11 +17,14 @@
 
 ## 为什么还需要一个脚本
 
-因为网上大多数教程已经**过时**了。GitHub 的 Stars 分页早就不是 `?page=N`，而是**游标分页** `?after=<cursor>&tab=stars`。
+因为网上大多数教程已经**过时**了，而且两个标签页的分页机制**还不一样**：
 
-实测（2026-10）：请求 `?tab=stars&page=2` 返回的是**第一页**，内容与第一页完全一致。所以照老办法写 `page++` 只会原地打转。
+| 标签页 | 分页方式 | 说明 |
+|---|---|---|
+| Stars | 游标 `?after=<cursor>&tab=stars` | 实测 `?tab=stars&page=2` 返回的是**第一页**，照老办法写 `page++` 只会原地打转 |
+| 仓库 | 经典 `?page=N&tab=repositories` | 与 Stars 相反，`?page=2` 是**有效**的 |
 
-本脚本的做法是：**从分页区 "Next" 链接的 `href` 里取下一个游标**，同时天然兼容排序参数。
+本脚本的做法是：**一律从分页区 "Next" 链接的 `href` 里取下一页地址**，因此两套机制都能正确处理，排序 / 过滤参数（`type=source`、`sort`、`q` 等）也天然带上。
 
 ## 特性
 
@@ -26,10 +32,10 @@
 |---|---|
 | 触发 | 滚动接近底部自动加载（`IntersectionObserver` + 哨兵，提前 900px 预加载） |
 | 追加 | 新条目直接挂在列表末尾，不刷新、不跳转、滚动位置不变，按 `owner/repo` 自动去重 |
-| 终止 | 无下一页游标即停止请求，显示「已到底 · 共 N 个仓库 / M 页」 |
+| 终止 | 无下一页地址即停止请求，显示「已到底 · 共 N 个仓库 / M 页」 |
 | 界面 | 隐藏原生分页按钮；底部状态胶囊显示进度，颜色跟随 GitHub 浅色/深色主题 |
 | 容错 | 失败自动退避重试 3 次；仍失败则**下次滚动即重试**，另有手动「重试」按钮 |
-| 范围 | 任意用户的 Stars 页；从其他页面点进来（Turbo 无刷新跳转）同样生效 |
+| 范围 | 任意用户的 **Stars** 和 **仓库** 页；从其他页面点进来（Turbo 无刷新跳转）同样生效 |
 | 性能 | 视口外跳过布局绘制、分块挂载避免长任务、空闲预取消除等待期、**滚动回收**（上方已浏览的整页换成等高占位块，回看再补回）—— 几千条也不卡 |
 | 依赖 | 无。纯浏览器端，不需要服务器、不需要 Token，不上传任何数据 |
 
@@ -53,15 +59,24 @@
 
 ## 使用
 
-打开任意用户的 Stars 页，例如 `https://github.com/zopdems?tab=stars`，向下滚动即可。
+打开任意用户的 **Stars** 或 **仓库** 页，向下滚动即可：
+
+```
+https://github.com/zopdems?tab=stars          # 星标
+https://github.com/zopdems?tab=repositories   # 仓库（加 &type=source 只看非 fork）
+```
+
+> 想看**自己的**仓库列表，用 `https://github.com/{你的用户名}?tab=repositories`（和看星标一样，在个人主页的标签页里）。
+> 登录后的仪表盘 `https://github.com/?tab=repositories` 是另一套布局、需要登录态，本版本不覆盖。
 
 调试入口（浏览器控制台）：
 
 ```js
-GHStarsInfinite.loadMore()            // 手动触发一次加载
-GHStarsInfinite.state               // 查看 seen / page / nextUrl / done / pages
-GHStarsInfinite.pages()             // 一览每页：是否已回收、缓存是否在、节点数、高度
-GHStarsInfinite.recycleNow()        // 立刻执行一次"回收上方整页"
+GHStarsInfinite.activeTab()        // 当前生效的标签页：'stars' | 'repositories' | null
+GHStarsInfinite.loadMore()         // 手动触发一次加载
+GHStarsInfinite.state              // 查看 seen / page / nextUrl / done / pages / list
+GHStarsInfinite.pages()            // 一览每页：是否已回收、缓存是否在、节点数、高度
+GHStarsInfinite.recycleNow()       // 立刻执行一次"回收上方整页"
 ```
 
 可调参数都集中在脚本顶部的 `CONFIG`（预加载距离、请求间隔、重试次数、最大页数等）。
@@ -107,27 +122,28 @@ v1.3.0 增加了「滚动回收」（`CONFIG.recycle = true`，默认开）：
 ## 它是怎么工作的
 
 ```
-URL 是 /{user}?tab=stars ?
+URL 是 /{user}?tab=stars 或 ?tab=repositories ?
         ▼
-定位 <turbo-frame id="user-starred-repos">
+定位对应 turbo-frame（Stars=#user-starred-repos，仓库=#user-profile-frame）
         ▼
-已有 30 条铺底做去重基线 → 从分页区取第一个游标
+已有条目铺底做去重基线 → 从分页区取下一页地址（游标 or 页码，随标签页而定）
         ▼
 列表末尾插哨兵 → IntersectionObserver 监听（提前 900px）
         │ 哨兵进入视口
         ▼
-fetch(nextUrl, { Turbo-Frame: user-starred-repos })   ← 只返回帧片段，328KB → 193KB
+fetch(nextUrl, { Turbo-Frame: <帧id> })   ← 只返回帧片段（Stars 328KB→193KB；仓库 400KB→270KB）
         ▼
-DOMParser 解析 → 抽条目 → 去重 → appendChild
+DOMParser 解析 → 抽条目 → 去重 → 追加到列表容器（Stars=帧，仓库=条目所在的 <ul>）
         ▼
-取下一个游标：有 → 继续监听；无 → 停止并显示「已到底」
+取下一页地址：有 → 继续监听；无 → 停止并显示「已到底」
 ```
 
 几个关键取舍：
 
-- **游标驱动**，不自己拼 URL
+- **下一页地址一律复用 Next 链接的 href**，两套分页机制（游标 / 页码）都不自己拼 URL
 - **带 `Turbo-Frame` 头只取片段**，解析不出条目时自动降级为整页重抓
 - **抽条目不能直接取 `frame.children`** —— 条目外还有一层 wrapper，那样会把 wrapper 当成 1 个条目
+- **两个标签页用不同的容器 / 条目选择器 / 追加容器**（仓库的条目在 `<ul>` 里，占位块也要是 `<li>` 才不破坏列表结构）
 - **到底后要留结束标记**，否则 `MutationObserver` 会误判为「未初始化」而重启，陷入死循环
 - **滚动回收按"整页"换占位块**：回收前测一次该页真实高度缓存下来，占位条高度与之相等，所以滚动位置不跳变；回看时整页节点从缓存插回原位（缓存被驱逐才重新拉取这一页）
 
@@ -137,6 +153,7 @@ DOMParser 解析 → 抽条目 → 去重 → appendChild
 
 - 克隆出来的条目，其「取消星标」按钮带的是抓取时刻的 CSRF token，刷新页面后操作即可，不影响浏览
 - 只匹配 `https://github.com/*`；企业版 GHE 改一行 `@match` 即可
+- 覆盖 `/{用户}?tab=stars` 和 `/{用户}?tab=repositories`；**登录后的仪表盘 `/?tab=repositories` 是另一套布局，不覆盖**（看自己的仓库请用个人主页的 Repositories 标签页）
 - GitHub 若改版 DOM，脚本会安全地停止并提示「已到底」而不是疯狂重试
 
 ## 许可证
