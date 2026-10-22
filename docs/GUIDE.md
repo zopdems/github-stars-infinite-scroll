@@ -15,6 +15,7 @@
 | stargazers / watchers | `/{o}/{r}/stargazers\|watchers` | `repo-content-turbo-frame` | `ul > li.Box-row` | user |
 | issues | `/{o}/{r}/issues` | `repo-content-turbo-frame` | `ul > li` | issue |
 | pulls | `/{o}/{r}/pulls` | `repo-content-turbo-frame` | `ul > li` | pr |
+| releases | `/{o}/{r}/releases` | `repo-content-turbo-frame` | `div.Box` | release |
 | commits | `/{o}/{r}/commits/{分支}` | `repo-content-turbo-frame` | `li[data-testid="commit-row-item"]` | commit |
 
 ---
@@ -87,6 +88,16 @@
 > </nav>
 > ```
 
+### Releases（`/{o}/{r}/releases`）—— 最"别扭"的一种结构
+
+| # | 结论 | 验证方式 / 影响 |
+|---|------|----------------|
+| 1 | 分页是**经典** `.paginate-container` + `?page=N` | Next 链接 `a[aria-label="Next page"]`，与其它仓库子页一致 |
+| 2 | 条目是 `div.Box`（release 卡片），容器 `repo-content-turbo-frame` | 帧里 `div.Box` 能匹配到 31 个，但有 release 链接的只有 10 个 —— 靠 key 过滤 |
+| 3 | **每个 release 的 `div.Box` 外面还套了两层**：一个无 class 的 `div`，再外面一个 `div.tmp-my-5`，而且**每个 release 各有一份** | 所以父元素、祖父元素都不对 —— 任何"固定层级"的做法在这里必然失败 |
+| 4 | 真正的列表容器是这三层之上的公共祖先（实测 `div.col-md-9`） | 只能靠"投票"算法定位，见第二节 `dominantContainer` |
+| 5 | 版本名链接是 `/o/r/releases/tag/{tag}` | key = `release:owner/repo@tag`（tag 做 URL 解码 + 小写） |
+
 **统一做法**：下一页地址一律复用 Next 链接的 `href`，因此游标 / 页码 / 搜索三套机制都不用自己拼；容器、条目选择器、追加容器、占位块标签、key 类型按列表类型在 `LISTS` 里分流（见第二节）。
 
 ---
@@ -127,7 +138,7 @@ DOMParser 解析 → 取 turbo-frame → 抽条目 → 按 owner/repo 去重
 | `activeList()` | 页面识别：对 `LISTS` 里每一类依次调 `match(路径片段, query)`，命中即返回列表 id；排除 GitHub 保留路径（`/topics`、`/marketplace`…） |
 | `LISTS` | 按列表类型配置：`match` / `frameId` / `itemSelectors` / `listMode`（frame 帧、list 父 `<ul>`、parent 父元素）/ `placeholderTag` / `keyKind` |
 | `KEY_PATTERNS` + `itemKey()` | 按 `keyKind`（repo / user / issue / pr / commit）从条目内的链接路径解析唯一 key；提交优先用 `data-commit-link` |
-| `findFrame()` / `extractItems()` / `dominantGroup()` | DOM 抽取；选择器按 `state.itemSelectors` 取，取完再按"候选项最多的父容器"过滤掉侧栏/页脚里的同类元素 |
+| `findFrame()` / `extractItems()` / `dominantContainer()` / `dominantGroup()` | DOM 抽取；选择器按 `state.itemSelectors` 取，再用"投票"定位真正的列表容器，把侧栏/页脚里的同类元素剔掉 |
 | `extractNextUrl()` / `pickNext()` / `isPrevLink()` | 找下一页：先查分页容器（三种），再放宽到全文档找 `rel=next` / aria / `.next_page` / 文案；排除 Previous |
 | `loadNext()` | 单次加载：节流 → 请求 → 解析 → 追加 → 推进 / 结束 |
 | `finish()` | 终止：解绑观察、打结束标记、显示"已到底" |
@@ -341,7 +352,39 @@ const LISTS = {
 
 **下一页地址三套机制通用**：一律复用 Next 链接 href（Stars/提交的 `after` 游标、其余的 `page=N` 都自带当前过滤参数），所以 `extractNextUrl` 只需**放宽查找范围**，不用为每种分页写分支。
 
-另外 `extractItems` 加了一道"`dominantGroup`"过滤：把候选项按父容器分组，只保留**候选项最多的那一组**。Fork 页用 `ul > li` 会多抓到 4 个侧栏里的同类 `li`，这道过滤正好把它们丢掉（实测 29 → 25）。
+### 列表容器怎么定位：投票算法
+
+上面那张表里有个坑：**不同列表的条目层级不一样**，而且 Releases 每个 `div.Box` 外面还套了「无 class div + `div.tmp-my-5`」两层、每个 release 各一份。所以"取父元素"或"取祖父元素"这种固定层级的做法都会错。
+
+解法是**投票**：每个条目从自己开始往上走，找到**第一个能装下至少 2 个条目**的祖先，就给这个祖先投一票；最后取得票最多的容器（并列时取装得更多的、再并列取更深的）。然后只保留"投给它"的条目。
+
+```js
+function voteContainers(items) {
+  const votes = new Map(), voteOf = new Map();
+  for (const el of items) {
+    let a = el.parentElement, depth = 1;
+    while (a && a.nodeType === 1 && a !== document.body) {
+      let n = 0;
+      for (const o of items) if (o === a || a.contains(o)) n++;
+      if (n >= 2) { const c = votes.get(a) || { votes: 0, n, depth }; c.votes++; votes.set(a, c); voteOf.set(el, a); break; }
+      a = a.parentElement; depth++;
+    }
+  }
+  return { votes, voteOf };
+}
+```
+
+为什么这样能同时满足三种情况：
+
+| 结构 | 每个条目投给谁 | 结果 |
+|---|---|---|
+| 普通 `ul > li`（Forks / Issues / PR / 提交 / 仓库） | 父级 `<ul>`，25 票一边倒 | 容器 = `<ul>`，杂项被剔除 |
+| Releases（`div.Box` 外套两层、每个 release 各一份） | 一路爬到包含全部 10 条的公共祖先，10 票 | 容器 = `div.col-md-9` |
+| 侧栏/页脚混进来的单个同类元素 | 只能爬到高层容器，得票恒为 1 | 永远竞争不过，被 `dominantGroup` 丢掉 |
+
+> ⚠️ 曾经走过的弯路：先试过"取候选项最多的父容器"（Releases 每个 Box 的父容器都不同，直接失效），
+> 又试过"取包含全部条目的最低公共祖先"（ Issues 页有个杂项只能爬到高层，反而把 25 条真条目 + 1 个杂项
+> 一起圈进来，多抓了一条）。最后才定在"投票 + 只保留投给冠军的条目"。
 
 ---
 
@@ -379,6 +422,7 @@ https://github.com/zopdems?tab=followers             # 关注者
 https://github.com/torvalds/linux/forks              # Fork 分支
 https://github.com/sindresorhus/type-fest/issues     # Issues
 https://github.com/kubernetes/kubernetes/pulls       # Pull requests
+https://github.com/henrygd/beszel/releases            # Releases
 https://github.com/torvalds/linux/commits/master     # 提交
 ```
 
@@ -630,6 +674,28 @@ function onUserScroll() {
 | commits | 32 | `commit:4df4d2a577db…` | 追加 24 → 累计 56（8 条跨页重复被去重，符合预期） |
 
 回归：`test-recycle.js`（Stars）20/20、`test-repos.js`（仓库）21/21 仍全过，共 **121 项断言**。
+
+**Releases + 投票算法（v1.6.0，`test-lists.js` 90 项断言全过 + 6 类真实页面复验）**
+
+合成页（新增 releases 一类，条目结构含「无 class div + `div.tmp-my-5`」两层外套）：
+
+- 识别为 `releases`、`keyKind = release`、key 形如 `release:acme/widget@v0.1.0`
+- 首页 4 条、翻到第 2 页追加 4 条累计 8 条；回收/补回正常，占位块标签 = `div`
+
+真实页面复验（6 类，条目数与容器全部正确）：
+
+| 页面 | 条目数 | 定位到的容器 |
+|---|---|---|
+| releases（henrygd/beszel） | 10 | `div.col-md-9` |
+| forks（torvalds/linux） | 25 | `ul` |
+| issues（sindresorhus/type-fest） | 25 | `ul.ul__5IxUHb` |
+| pulls（kubernetes/kubernetes） | 25 | `ul.ul__5IxUHb` |
+| commits（torvalds/linux） | 32 | `ul.ul__5IxUHb` |
+| followers（sindresorhus） | 50 | `div.position-relative` |
+
+Releases 端到端：首页 10 条 → 加载第 2 页追加 10 条累计 20 条 → next 指向 `page=3` → 回收第 1 页为 1200px 占位块 → 回看补回 10 条。
+
+回归：Stars 20/20、仓库 21/21，共 **131 项断言**。
 
 > 未覆盖：`/search`（纯 React 应用，会重渲染清掉追加内容，容器类名带构建哈希）；
 > `/{仓库}/stargazers`、`/{仓库}/watchers` 匿名访问 404（需登录），结构与 Fork 同构故一并登记，未做真实验证。

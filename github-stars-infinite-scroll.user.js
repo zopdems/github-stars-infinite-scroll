@@ -2,8 +2,8 @@
 // @name         GitHub 列表无限滚动
 // @name:zh-CN   GitHub Stars 无限滚动
 // @namespace    https://github.com/
-// @version      1.5.0
-// @description  给 GitHub 上所有可翻页的列表加自动翻页：Stars、仓库、关注者/正在关注、Fork、星标者、关注者、Issues、Pull requests、提交。滚动接近底部自动加载并追加到末尾，隐藏原生分页，到底给出提示，失败滚动重试；支持滚动回收（上方整页换等高占位块、回看补回），长列表不卡顿。
+// @version      1.6.0
+// @description  给 GitHub 上所有可翻页的列表加自动翻页：Stars、仓库、关注者/正在关注、Fork、星标者、关注者、Issues、Pull requests、Releases、提交。滚动接近底部自动加载并追加到末尾，隐藏原生分页，到底给出提示，失败滚动重试；支持滚动回收（上方整页换等高占位块、回看补回），长列表不卡顿。
 // @author       zopdems
 // @license      MIT
 // @homepageURL  https://github.com/zopdems/github-stars-infinite-scroll
@@ -176,6 +176,13 @@
       itemSelectors: ['ul > li'],
       listMode: 'parent', placeholderTag: 'li', keyKind: 'pr'
     },
+    releases: {
+      label: 'Releases',
+      match: (seg) => seg.length === 3 && seg[2] === 'releases',
+      frameId: 'repo-content-turbo-frame',
+      itemSelectors: ['div.Box'],
+      listMode: 'parent', placeholderTag: 'div', keyKind: 'release'
+    },
     commits: {
       label: '提交',
       match: (seg) => seg.length >= 3 && seg[2] === 'commits',
@@ -188,11 +195,12 @@
 
   /* ---- 条目唯一 key：按 keyKind 从条目内的链接里解析 ---- */
   const KEY_PATTERNS = {
-    repo:   /^\/([^/]+)\/([^/]+)\/?$/,                     // /owner/repo
-    user:   /^\/([^/]+)\/?$/,                              // /username
-    issue:  /^\/([^/]+)\/([^/]+)\/issues\/(\d+)/,          // /owner/repo/issues/123
-    pr:     /^\/([^/]+)\/([^/]+)\/pull\/(\d+)/,            // /owner/repo/pull/123
-    commit: /^\/([^/]+)\/([^/]+)\/commit\/([0-9a-f]{7,40})/
+    repo:    /^\/([^/]+)\/([^/]+)\/?$/,                     // /owner/repo
+    user:    /^\/([^/]+)\/?$/,                              // /username
+    issue:   /^\/([^/]+)\/([^/]+)\/issues\/(\d+)/,          // /owner/repo/issues/123
+    pr:      /^\/([^/]+)\/([^/]+)\/pull\/(\d+)/,            // /owner/repo/pull/123
+    commit:  /^\/([^/]+)\/([^/]+)\/commit\/([0-9a-f]{7,40})/,
+    release: /^\/([^/]+)\/([^/]+)\/releases\/tag\/([^/]+)/  // /owner/repo/releases/tag/{tag}
   };
 
   /** 当前处于哪个受支持的列表页，返回 LISTS 的 key 或 null */
@@ -456,11 +464,16 @@
       if (RESERVED.has(m[1].toLowerCase())) continue;   // /topics/xxx 之类
       const o = m[1].toLowerCase();
       switch (kind) {
-        case 'repo':   return o + '/' + m[2].toLowerCase();
-        case 'user':   return 'user:' + o;
-        case 'issue':  return 'issue:' + o + '/' + m[2].toLowerCase() + '#' + m[3];
-        case 'pr':     return 'pr:' + o + '/' + m[2].toLowerCase() + '#' + m[3];
-        case 'commit': return 'commit:' + m[3].toLowerCase();
+        case 'repo':    return o + '/' + m[2].toLowerCase();
+        case 'user':    return 'user:' + o;
+        case 'issue':   return 'issue:' + o + '/' + m[2].toLowerCase() + '#' + m[3];
+        case 'pr':      return 'pr:' + o + '/' + m[2].toLowerCase() + '#' + m[3];
+        case 'commit':  return 'commit:' + m[3].toLowerCase();
+        case 'release': {
+          let tag = m[3];
+          try { tag = decodeURIComponent(tag); } catch (e) { /* 保持原样 */ }
+          return 'release:' + o + '/' + m[2].toLowerCase() + '@' + tag.toLowerCase();
+        }
       }
       return null;
     }
@@ -487,21 +500,63 @@
     return dominantGroup(fallback) || [];
   }
 
-  /** 按父容器分组，返回候选项最多的那一组（同时拿到真实列表容器） */
+  /**
+   * 给每个条目找它"第一个能装下至少 2 个条目"的祖先（= 这个条目认定的列表容器）。
+   * 同时统计每个容器拿到多少票、以及它一共装着多少条目。
+   */
+  function voteContainers(items) {
+    const votes = new Map();   // container -> { votes, n, depth }
+    const voteOf = new Map();  // item -> 它投票的容器
+    for (const el of items) {
+      let a = el.parentElement, depth = 1;
+      while (a && a.nodeType === 1 && a !== document.body) {
+        let n = 0;
+        for (const o of items) if (o === a || a.contains(o)) n++;
+        if (n >= 2) {
+          const cur = votes.get(a) || { votes: 0, n: n, depth: depth };
+          cur.votes += 1;
+          votes.set(a, cur);
+          voteOf.set(el, a);
+          break;
+        }
+        a = a.parentElement;
+        depth++;
+      }
+    }
+    return { votes: votes, voteOf: voteOf };
+  }
+
+  /**
+   * 找"真正的列表容器"：按**得票多少**选（并列时取装得更多的、再并列取更深的）。
+   *   - 多数列表条目同级（ul > li），一级就命中那个 <ul>，票数一边倒；
+   *   - Releases 每个 div.Box 外还套了「div + div.tmp-my-5」两层且每个 release 各一份，
+   *     于是一路爬到包含全部 10 条的那个容器，10 条都投它；
+   *   - 侧栏/页脚里混进来的单个同类元素，只能爬到高层容器，得票永远只有 1，竞争不过。
+   */
+  function dominantContainer(items) {
+    if (!items || !items.length) return null;
+    if (items.length === 1) return { el: items[0].parentElement, n: 1, depth: 1, votes: 1 };
+    const v = voteContainers(items);
+    let best = null;
+    for (const [el, info] of v.votes) {
+      if (!best || info.votes > best.votes ||
+          (info.votes === best.votes && info.n > best.n) ||
+          (info.votes === best.votes && info.n === best.n && info.depth > best.depth)) {
+        best = { el: el, n: info.n, depth: info.depth, votes: info.votes };
+      }
+    }
+    return best;
+  }
+
+  /** 只保留"投票给列表容器"的条目（把侧栏/页脚里的同类元素剔掉） */
   function dominantGroup(items) {
     if (!items.length) return items;
-    const byParent = new Map();
-    for (const el of items) {
-      const p = el.parentElement;
-      if (!p) continue;
-      const arr = byParent.get(p) || [];
-      arr.push(el);
-      byParent.set(p, arr);
-    }
-    if (!byParent.size) return items;
-    let best = null;
-    for (const arr of byParent.values()) if (!best || arr.length > best.length) best = arr;
-    return best;
+    if (items.length === 1) return items;
+    const v = voteContainers(items);
+    const best = dominantContainer(items);
+    if (!best || !best.el) return items;
+    const out = items.filter(el => v.voteOf.get(el) === best.el);
+    return out.length ? out : items;
   }
 
   /** 一个链接是不是「上一页」，是就排除 */
@@ -1010,13 +1065,11 @@ html.${HTML_FLAG} .ghsi-item {
 
     // 追加/回收容器：多数列表的条目都装在一个 <ul>/<div> 容器里（不是帧的直接子元素），
     // 要找到它；Stars 页条目就在帧里，直接用帧本身。
+    // 用 dominantContainer 而不是直接取父元素 —— Releases 的每个 div.Box 外还包了一层
+    // 无 class 的 div，只有祖父容器才装得下全部条目。
     if (firstNodes.length && cfg.listMode !== 'frame') {
-      const p = firstNodes[0].parentElement;
-      if (cfg.listMode === 'list') {
-        state.list = (p && /^(UL|OL)$/.test(p.tagName)) ? p : frame;
-      } else {                        // 'parent'：条目的直接父元素，任意标签
-        state.list = p || frame;
-      }
+      const dc = dominantContainer(firstNodes);
+      state.list = dc ? dc.el : (firstNodes[0].parentElement || frame);
     } else {
       state.list = frame;
     }
@@ -1111,7 +1164,7 @@ html.${HTML_FLAG} .ghsi-item {
 
     // 内容还没渲染完（条目为 0 且也不是明确的空状态）-> 等下一次变化
     const hasItems = extractItems(frame).length > 0;
-    const emptyState = /hasn't starred|doesn't have any starred|no starred|haven't starred|any public repositories|doesn't have any repositories|no repositories yet|doesn't have any followers|doesn't follow anyone|no forks|no issues|no pull requests|no commits/i
+    const emptyState = /hasn't starred|doesn't have any starred|no starred|haven't starred|any public repositories|doesn't have any repositories|no repositories yet|doesn't have any followers|doesn't follow anyone|no forks|no issues|no pull requests|no commits|no releases|hasn't released/i
       .test(frame.textContent || '');
     if (!hasItems && !emptyState) return;
 

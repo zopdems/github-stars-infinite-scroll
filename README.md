@@ -21,6 +21,7 @@
 | 关注者 Watchers | `/{仓库}/watchers` | 用户 `用户名` |
 | Issues | `/{仓库}/issues` | Issue `owner/repo#号` |
 | Pull requests | `/{仓库}/pulls` | PR `owner/repo#号` |
+| Releases | `/{仓库}/releases` | 版本 `owner/repo@tag` |
 | 提交 Commits | `/{仓库}/commits/{分支}` | 提交 `sha` |
 
 排序 / 过滤参数（`type=source`、`state=open`、`q=…` 等）**自动保留**——因为下一页地址直接复用分页区 Next 链接的 href。
@@ -79,6 +80,7 @@ https://github.com/zopdems?tab=stars                 # 星标
 https://github.com/zopdems?tab=repositories          # 仓库（&type=source 只看非 fork）
 https://github.com/torvalds/linux/forks              # Fork 分支
 https://github.com/sindresorhus/type-fest/issues     # Issues
+https://github.com/henrygd/beszel/releases          # Releases
 https://github.com/torvalds/linux/commits/master     # 提交
 ```
 

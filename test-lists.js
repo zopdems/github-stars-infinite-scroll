@@ -37,7 +37,13 @@ const ITEMS = {
   issue: (i) => `<li><div><h3 class="heading"><a href="/${O}/${R}/issues/${i}">Issue ${i}</a></h3></div></li>`,
   pr: (i) => `<li><div><h3 class="heading"><a href="/${O}/${R}/pull/${i}">PR ${i}</a></h3></div></li>`,
   commit: (i) => `<li data-testid="commit-row-item" data-commit-link="/${O}/${R}/commit/${String(i).padStart(40, 'a')}">
-      <div><a href="/${O}/${R}/commit/${String(i).padStart(40, 'a')}">commit ${i}</a></div></li>`
+      <div><a href="/${O}/${R}/commit/${String(i).padStart(40, 'a')}">commit ${i}</a></div></li>`,
+  // Releases：条目是 div.Box，且**每个 release 外面还包了两层**（无 class div + div.tmp-my-5），
+  // 用来验证 dominantContainer 的投票算法能一路爬到正确的列表容器
+  release: (i) => `<div class="tmp-my-5"><div><div class="Box"><div class="Box-body">
+      <div class="d-flex flex-md-row"><div class="d-flex flex-row flex-1">
+      <div class="flex-1"><span class="f1"><a href="/${O}/${R}/releases/tag/v0.${i}.0">v0.${i}.0</a></span>
+      <span><a href="/${O}/${R}/releases/latest">Latest</a></span></div></div></div></div></div></div></div>`
 };
 
 /* ---------- 各列表的分页区 ---------- */
@@ -73,11 +79,9 @@ function pageHTML(listId, pageNum, hasNext, per, gen) {
     const n = (pageNum - 1) * per + i;
     body += gen(n);
   }
-  const frameId = (listId === 'followers' || listId === 'following') ? 'user-profile-frame'
-                : (listId === 'forks' || listId === 'issues' || listId === 'pulls' ||
-                   listId === 'commits' || listId === 'stargazers' || listId === 'watchers')
-                  ? 'repo-content-turbo-frame' : 'user-starred-repos';
-  const inner = /^(user)$/.test(listId) ? body : `<ul>${body}</ul>`;   // 用户列表是 div，其余装在 ul 里
+  const frameId = (listId === 'followers' || listId === 'following')
+    ? 'user-profile-frame'
+    : 'repo-content-turbo-frame';   // forks / stargazers / watchers / issues / pulls / commits / releases
   const items = (listId === 'followers' || listId === 'following') ? body : `<ul>${body}</ul>`;
   return `<!doctype html><html><body><main>
     <turbo-frame id="${frameId}"><div class="position-relative">${items}</div>${pagination(listId, pageNum, hasNext)}</turbo-frame>
@@ -92,7 +96,8 @@ const SPECS = [
   { id: 'watchers',   url: `https://github.com/${O}/${R}/watchers`,       kind: 'user',   gen: ITEMS.userLi, per: 4 },
   { id: 'issues',     url: `https://github.com/${O}/${R}/issues`,         kind: 'issue',  gen: ITEMS.issue,  per: 4 },
   { id: 'pulls',      url: `https://github.com/${O}/${R}/pulls`,          kind: 'pr',     gen: ITEMS.pr,     per: 4 },
-  { id: 'commits',    url: `https://github.com/${O}/${R}/commits/master`, kind: 'commit', gen: ITEMS.commit, per: 4 }
+  { id: 'commits',    url: `https://github.com/${O}/${R}/commits/master`, kind: 'commit', gen: ITEMS.commit, per: 4 },
+  { id: 'releases',   url: `https://github.com/${O}/${R}/releases`,        kind: 'release', gen: ITEMS.release, per: 4 }
 ];
 
 function makeDom(spec, page1Html) {
@@ -138,7 +143,7 @@ async function run() {
     ok(`首页解析出 ${spec.per} 条`, st.seen.size === spec.per, st.seen.size);
 
     const keys = [...st.seen];
-    const expectPrefix = { user: 'user:', issue: 'issue:', pr: 'pr:', commit: 'commit:', repo: '' }[spec.kind];
+    const expectPrefix = { user: 'user:', issue: 'issue:', pr: 'pr:', commit: 'commit:', release: 'release:', repo: '' }[spec.kind];
     ok(`key 前缀正确（${expectPrefix || '无'}）`, keys.every(k => k.startsWith(expectPrefix)), keys.slice(0, 2));
     ok('nextUrl 已取到', !!st.nextUrl, st.nextUrl);
 
