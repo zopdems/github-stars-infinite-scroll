@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         GitHub Stars 无限滚动
+// @name         GitHub 列表无限滚动
 // @name:zh-CN   GitHub Stars 无限滚动
 // @namespace    https://github.com/
-// @version      1.4.0
-// @description  在任意 GitHub 用户的「Stars」和「仓库 / Repositories」标签页实现无限滚动：滚动接近底部自动加载下一页并追加到列表末尾，隐藏原生分页按钮，加载完给出「已到底」提示，失败后滚动即可重试；支持滚动回收——把视口上方已浏览的整页换成等高占位块，回看时再补回，长列表不再卡顿。
+// @version      1.5.0
+// @description  给 GitHub 上所有可翻页的列表加自动翻页：Stars、仓库、关注者/正在关注、Fork、星标者、关注者、Issues、Pull requests、提交。滚动接近底部自动加载并追加到末尾，隐藏原生分页，到底给出提示，失败滚动重试；支持滚动回收（上方整页换等高占位块、回看补回），长列表不卡顿。
 // @author       zopdems
 // @license      MIT
 // @homepageURL  https://github.com/zopdems/github-stars-infinite-scroll
@@ -43,7 +43,7 @@
  *   5. 最后一页的 .paginate-container 里没有 next_page 链接 —— 终止信号同上。
  *
  *  下一页 URL 一律复用分页区 Next 链接的 href，因此两套分页机制都能正确处理，
- *  排序/过滤参数也自动带上。容器、条目选择器、占位块标签按 tab 在 TABS 里分流。
+ *  排序/过滤参数也自动带上。容器、条目选择器、占位块标签按列表类型在 LISTS 里分流。
  * ──────────────────────────────────────────────────────────────
  */
 
@@ -52,7 +52,7 @@
 
   /* ============================ 配置 ============================ */
   const CONFIG = {
-    // frameId / 条目选择器 / 占位块标签 现按标签页在下方 TABS 里配置（Stars 与 仓库 各一套）
+    // frameId / 条目选择器 / 占位块标签 / key 类型 现按列表类型在下方 LISTS 里配置
     preloadPx: 900,                // 距底部还有多少像素就开始预加载
     minIntervalMs: 350,            // 两次请求的最小间隔（ms），防抖/防风控
     maxRetry: 3,                   // 同一页自动重试次数
@@ -85,39 +85,128 @@
     'users', 'watching'
   ]);
 
-  /* ======================= 标签页配置（Stars / 仓库） =======================
-   * 两个标签页的容器、条目选择器、追加容器、占位块标签都不同，按 tab 参数分流：
-   *   - Stars：      turbo-frame#user-starred-repos，条目 div.col-12…border-bottom，
-   *                  追加容器就是帧本身，游标分页 ?after=<cursor>。
-   *   - 仓库：       turbo-frame#user-profile-frame，条目 ul > li.col-12…border-bottom，
-   *                  追加容器是条目所在的 <ul>，经典分页 ?page=N。
-   * 下一页 URL 一律复用分页区 Next 链接 href，排序/过滤参数（type=source 等）自动带上。
-   * ======================================================================== */
-  const TABS = {
+  /* ======================= 可翻页列表注册表 =======================
+   * 每类列表的容器、条目选择器、追加容器、占位块标签、条目 key 类型都不同，
+   * 全部实测（2026-10）后登记在此；加载/去重/回收/补回/重试等逻辑完全复用。
+   *
+   *   keyKind：repo(仓库) / user(用户) / issue / pr / commit
+   *   listMode：frame=追加到帧本身；list=追加到条目的父 <ul>/<ol>；parent=追加到条目的父元素
+   *
+   * 分页机制有三套（游标 ?after= / 页码 ?page=N / 搜索 ?p=N），
+   * 但下一页地址一律复用 Next 链接的 href，所以不用区分，过滤参数也自动带上。
+   * ============================================================== */
+  const LISTS = {
+    /* ---------- 个人主页标签页 ---------- */
     stars: {
+      label: '星标',
+      match: (seg, q) => seg.length === 1 && q.get('tab') === 'stars',
       frameId: 'user-starred-repos',
       itemSelectors: [
         'div[class*="col-12"][class*="border-bottom"]',
         'div[class*="border-bottom"]',
         'div[class*="width-full"]'
       ],
-      listMode: 'frame',      // 追加容器 = turbo-frame 本身
-      placeholderTag: 'div'   // 回收占位块用 <div>
+      listMode: 'frame', placeholderTag: 'div', keyKind: 'repo'
     },
     repositories: {
+      label: '仓库',
+      match: (seg, q) => seg.length === 1 && q.get('tab') === 'repositories',
       frameId: 'user-profile-frame',
       itemSelectors: [
         'li[class*="col-12"][class*="border-bottom"]',
         'li[class*="col-12"][class*="flex-justify-between"]',
         'li[class*="col-12"]'
       ],
-      listMode: 'list',       // 追加容器 = 条目所在的 <ul>
-      placeholderTag: 'li'    // 回收占位块用 <li>（保持 <ul> 结构合法）
+      listMode: 'list', placeholderTag: 'li', keyKind: 'repo'
+    },
+    followers: {
+      label: '关注者',
+      match: (seg, q) => seg.length === 1 && q.get('tab') === 'followers',
+      frameId: 'user-profile-frame',
+      itemSelectors: [
+        'div[class*="d-table"][class*="table-fixed"]',
+        'div[class*="col-12"][class*="border-bottom"]'
+      ],
+      listMode: 'parent', placeholderTag: 'div', keyKind: 'user'
+    },
+    following: {
+      label: '正在关注',
+      match: (seg, q) => seg.length === 1 && q.get('tab') === 'following',
+      frameId: 'user-profile-frame',
+      itemSelectors: [
+        'div[class*="d-table"][class*="table-fixed"]',
+        'div[class*="col-12"][class*="border-bottom"]'
+      ],
+      listMode: 'parent', placeholderTag: 'div', keyKind: 'user'
+    },
+
+    /* ---------- 仓库子页面 ---------- */
+    forks: {
+      label: 'Fork 分支',
+      match: (seg) => seg.length === 3 && seg[2] === 'forks',
+      frameId: 'repo-content-turbo-frame',
+      itemSelectors: ['li.Box-row', 'ul > li'],
+      listMode: 'parent', placeholderTag: 'li', keyKind: 'repo'
+    },
+    stargazers: {
+      label: '星标者',
+      match: (seg) => seg.length === 3 && seg[2] === 'stargazers',
+      frameId: 'repo-content-turbo-frame',
+      itemSelectors: ['li.Box-row', 'ul > li'],
+      listMode: 'parent', placeholderTag: 'li', keyKind: 'user'
+    },
+    watchers: {
+      label: '关注者',
+      match: (seg) => seg.length === 3 && seg[2] === 'watchers',
+      frameId: 'repo-content-turbo-frame',
+      itemSelectors: ['li.Box-row', 'ul > li'],
+      listMode: 'parent', placeholderTag: 'li', keyKind: 'user'
+    },
+    issues: {
+      label: 'Issues',
+      match: (seg) => seg.length === 3 && seg[2] === 'issues',
+      frameId: 'repo-content-turbo-frame',
+      itemSelectors: ['ul > li'],
+      listMode: 'parent', placeholderTag: 'li', keyKind: 'issue'
+    },
+    pulls: {
+      label: 'Pull requests',
+      match: (seg) => seg.length === 3 && seg[2] === 'pulls',
+      frameId: 'repo-content-turbo-frame',
+      itemSelectors: ['ul > li'],
+      listMode: 'parent', placeholderTag: 'li', keyKind: 'pr'
+    },
+    commits: {
+      label: '提交',
+      match: (seg) => seg.length >= 3 && seg[2] === 'commits',
+      frameId: 'repo-content-turbo-frame',
+      itemSelectors: ['li[data-testid="commit-row-item"]', 'li[data-commit-link]', 'ul > li'],
+      listMode: 'parent', placeholderTag: 'li', keyKind: 'commit'
     }
   };
-  const FALLBACK_ITEM_SELECTORS = TABS.stars.itemSelectors; // state.tab 未定时兜底
+  const FALLBACK_ITEM_SELECTORS = LISTS.stars.itemSelectors; // state.listId 未定时兜底
 
-  const REPO_PATH = /^\/([^/]+)\/([^/]+)\/?$/;
+  /* ---- 条目唯一 key：按 keyKind 从条目内的链接里解析 ---- */
+  const KEY_PATTERNS = {
+    repo:   /^\/([^/]+)\/([^/]+)\/?$/,                     // /owner/repo
+    user:   /^\/([^/]+)\/?$/,                              // /username
+    issue:  /^\/([^/]+)\/([^/]+)\/issues\/(\d+)/,          // /owner/repo/issues/123
+    pr:     /^\/([^/]+)\/([^/]+)\/pull\/(\d+)/,            // /owner/repo/pull/123
+    commit: /^\/([^/]+)\/([^/]+)\/commit\/([0-9a-f]{7,40})/
+  };
+
+  /** 当前处于哪个受支持的列表页，返回 LISTS 的 key 或 null */
+  function activeList() {
+    if (location.hostname !== 'github.com') return null;
+    const seg = location.pathname.split('/').filter(Boolean);
+    if (seg.length && RESERVED.has(seg[0].toLowerCase())) return null;   // /topics 等保留路径
+    const q = new URLSearchParams(location.search);
+    for (const id of Object.keys(LISTS)) {
+      try { if (LISTS[id].match(seg, q)) return id; } catch (e) { /* ignore */ }
+    }
+    return null;
+  }
+
   const STYLE_ID = 'gh-stars-infinite-style';
   const SENTINEL_ID = 'gh-stars-infinite-sentinel';
   const END_ID = 'gh-stars-infinite-end';
@@ -129,11 +218,13 @@
 
   /* ============================ 状态 ============================ */
   const state = {
-    tab: null,              // 当前标签页：'stars' | 'repositories'
+    listId: null,           // 当前列表类型（LISTS 的 key）
+    keyKind: 'repo',        // 当前列表的条目 key 类型
+    itemSelectors: null,    // 当前列表的条目选择器
     frame: null,
-    frameId: null,          // 当前标签页的 turbo-frame id（来自 TABS）
-    list: null,             // 追加/回收的容器：Stars=帧本身，仓库=条目所在的 <ul>
-    placeholderTag: 'div',  // 回收占位块的标签：Stars=div，仓库=li
+    frameId: null,          // 当前列表的 turbo-frame id（来自 LISTS）
+    list: null,             // 追加/回收的容器（帧 / <ul> / 条目的父元素）
+    placeholderTag: 'div',  // 回收占位块的标签
     sentinel: null,
     endMarker: null,
     statusEl: null,
@@ -325,18 +416,7 @@
 
   /* ======================= 页面识别与工具 ======================= */
 
-  /** 当前处于哪个受支持的标签页：'stars' | 'repositories' | null（对任意用户名生效） */
-  function activeTab() {
-    if (location.hostname !== 'github.com') return null;
-    const tab = new URLSearchParams(location.search).get('tab');
-    if (tab !== 'stars' && tab !== 'repositories') return null;
-    const seg = location.pathname.split('/').filter(Boolean);
-    if (seg.length !== 1) return null;               // 只认 /{user} 这种单段路径
-    if (RESERVED.has(seg[0].toLowerCase())) return null;
-    return tab;
-  }
-
-  /** 取列表容器：优先当前标签页的 turbo-frame，逐级降级 */
+  /** 取列表容器：优先当前列表类型的 turbo-frame，逐级降级（main → body） */
   function findFrame(doc) {
     const id = state.frameId;
     return (id && doc.getElementById(id)) ||
@@ -345,55 +425,143 @@
            doc.body;
   }
 
-  /** 条目的唯一 key = owner/repo（小写）。不是仓库条目则返回 null */
+  /**
+   * 条目的唯一 key，按 keyKind 从条目内部的链接里解析；解析不到返回 null。
+   * 只认路径形态，不依赖 h2/h3 之类的包装标签，所以 fork 列表（仓库名在 h2 里）、
+   * issue/PR/提交列表都能用同一套逻辑；仓库条目里的 stargazers/forks 链接
+   * 是三段路径，不会被误当成 key。
+   */
   function itemKey(el) {
     if (!el || el.nodeType !== 1) return null;
-    const a = el.querySelector('h3 a[href]');
-    if (!a) return null;
-    let pathname;
-    try {
-      pathname = new URL(a.getAttribute('href'), location.href).pathname;
-    } catch (e) { return null; }
-    const m = REPO_PATH.exec(pathname);
-    if (!m) return null;
-    if (RESERVED.has(m[1].toLowerCase())) return null;
-    return (m[1] + '/' + m[2]).toLowerCase();
+    const kind = state.keyKind || 'repo';
+
+    // 提交行带稳定的 data-commit-link，优先用它（比解析链接更稳）
+    if (kind === 'commit') {
+      const cl = el.getAttribute && el.getAttribute('data-commit-link');
+      if (cl) {
+        const cm = /\/commit\/([0-9a-f]{7,40})/i.exec(cl);
+        if (cm) return 'commit:' + cm[1].toLowerCase();
+      }
+    }
+
+    const re = KEY_PATTERNS[kind];
+    if (!re) return null;
+    const links = el.querySelectorAll('a[href]');
+    for (const a of links) {
+      let pathname;
+      try { pathname = new URL(a.getAttribute('href'), location.href).pathname; }
+      catch (e) { continue; }
+      const m = re.exec(pathname);
+      if (!m) continue;
+      if (RESERVED.has(m[1].toLowerCase())) continue;   // /topics/xxx 之类
+      const o = m[1].toLowerCase();
+      switch (kind) {
+        case 'repo':   return o + '/' + m[2].toLowerCase();
+        case 'user':   return 'user:' + o;
+        case 'issue':  return 'issue:' + o + '/' + m[2].toLowerCase() + '#' + m[3];
+        case 'pr':     return 'pr:' + o + '/' + m[2].toLowerCase() + '#' + m[3];
+        case 'commit': return 'commit:' + m[3].toLowerCase();
+      }
+      return null;
+    }
+    return null;
   }
 
   /**
-   * 从容器里抽出仓库条目（选择器按当前标签页取）。
-   * 注意：条目外层可能还有 wrapper，不能直接取 frame.children
-   * （会把 wrapper 当成一个条目），必须深度查找后再
-   * 剔除「包含其它候选元素」的父级，只保留最内层的条目节点。
+   * 从容器里抽出条目（选择器按当前列表类型取）。
+   * 两道过滤保证只拿到真正的列表条目：
+   *   1) 条目外层可能还有 wrapper —— 剔除「包含其它候选元素」的父级，只留最内层；
+   *   2) 页面角落（侧栏、页脚）里可能有同标签、同样带链接的元素 —— 按父容器分组，
+   *      只保留「候选项最多的那个容器」，其余丢弃。
    */
   function extractItems(frame) {
-    const sels = (state.tab && TABS[state.tab]) ? TABS[state.tab].itemSelectors : FALLBACK_ITEM_SELECTORS;
+    const sels = state.itemSelectors || FALLBACK_ITEM_SELECTORS;
     for (const sel of sels) {
       const cands = Array.from(frame.querySelectorAll(sel)).filter(el => itemKey(el));
       const top = cands.filter(el => !cands.some(o => o !== el && o.contains(el)));
-      if (top.length) return top;
+      if (!top.length) continue;
+      const best = dominantGroup(top);
+      if (best && best.length) return best;
     }
-    return Array.from(frame.children).filter(el => itemKey(el));
+    const fallback = Array.from(frame.children).filter(el => itemKey(el));
+    return dominantGroup(fallback) || [];
   }
 
-  /** 从分页区取下一页 URL（游标地址）。没有分页区 / 没有 Next 链接 => null */
+  /** 按父容器分组，返回候选项最多的那一组（同时拿到真实列表容器） */
+  function dominantGroup(items) {
+    if (!items.length) return items;
+    const byParent = new Map();
+    for (const el of items) {
+      const p = el.parentElement;
+      if (!p) continue;
+      const arr = byParent.get(p) || [];
+      arr.push(el);
+      byParent.set(p, arr);
+    }
+    if (!byParent.size) return items;
+    let best = null;
+    for (const arr of byParent.values()) if (!best || arr.length > best.length) best = arr;
+    return best;
+  }
+
+  /** 一个链接是不是「上一页」，是就排除 */
+  function isPrevLink(a) {
+    if ((a.getAttribute('rel') || '') === 'prev') return true;
+    const cls = a.className || '';
+    if (/previous_page|prev_page/i.test(cls)) return true;
+    const al = (a.getAttribute('aria-label') || '') + ' ' + (a.textContent || '');
+    return /previous|上一页|上页/i.test(al);
+  }
+
+  /** 把一个「下一页」链接转成绝对地址；不可用则返回 null */
+  function absNextUrl(a) {
+    if (!a || !a.getAttribute) return null;
+    const href = a.getAttribute('href');
+    if (!href) return null;
+    try {
+      const url = new URL(href, location.href);
+      if (url.origin !== location.origin) return null;
+      return url.href;
+    } catch (e) { return null; }
+  }
+
+  /** 在给定范围内挑「下一页」链接（Next / Older / Newer / 下一页） */
+  function pickNext(scope) {
+    const links = Array.from(scope.querySelectorAll('a[href]')).filter(a => !isPrevLink(a));
+    return links.find(a => /^\s*(next|older|newer|下一页|下页)\s*$/i.test((a.textContent || '').trim())) ||
+           links.find(a => /next|older|newer/i.test(a.getAttribute('aria-label') || '')) ||
+           links.find(a => (a.getAttribute('rel') || '') === 'next') ||
+           links.find(a => /next|下一页/i.test((a.textContent || '')));
+  }
+
+  /**
+   * 取下一页 URL。GitHub 有三套分页 UI，这里从最规范到最宽松依次尝试：
+   *   1) 分页容器内（.paginate-container / [data-test-selector=pagination] /
+   *      nav[aria-label*=Pagination] —— 新版 React 分页）
+   *   2) 全文档里找 rel="next" / aria-label 含 Next / .next_page / 文案 Next
+   * 拿不到就返回 null（= 最后一页）。
+   */
   function extractNextUrl(scope) {
     const root = scope || document;
-    const boxes = root.querySelectorAll('.paginate-container, [data-test-selector="pagination"]');
+
+    // 1) 分页容器优先
+    const boxes = Array.from(root.querySelectorAll('.paginate-container, [data-test-selector="pagination"], nav'))
+      .filter(b => /paginate-container|pagination/i.test(b.className || '') ||
+                   /pagination/i.test(b.getAttribute('aria-label') || '') ||
+                   /PaginationContainer/i.test(b.className || ''));
     for (const box of boxes) {
-      const links = Array.from(box.querySelectorAll('a[href]'));
-      const next =
-        links.find(a => /^\s*(next|下一页|下页)\s*$/i.test((a.textContent || '').trim())) ||
-        links.find(a => /next|下一页/i.test(a.getAttribute('aria-label') || '')) ||
-        links.find(a => /next|下一页/i.test((a.textContent || '')));
-      if (!next) continue;
-      try {
-        const url = new URL(next.getAttribute('href'), location.href);
-        if (url.origin !== location.origin) continue;
-        return url.href;
-      } catch (e) { /* ignore */ }
+      const url = absNextUrl(pickNext(box));
+      if (url) return url;
     }
-    return null;
+
+    // 2) 放宽到整个文档
+    const all = Array.from(root.querySelectorAll('a[href]')).filter(a => !isPrevLink(a));
+    const link =
+      all.find(a => (a.getAttribute('rel') || '') === 'next') ||
+      all.find(a => /\bnext\b/i.test(a.getAttribute('aria-label') || '')) ||
+      all.find(a => /(^|\s)next_page(\s|$)/i.test(a.className || '')) ||
+      all.find(a => /^\s*(next|older|newer|下一页|下页)\s*$/i.test((a.textContent || '').trim()));
+    return absNextUrl(link);
   }
 
   /* ============================ 样式 ============================ */
@@ -401,9 +569,14 @@
   function injectStyle() {
     if (document.getElementById(STYLE_ID)) return;
     const css = `
-/* 1) 隐藏原生分页按钮（Stars 与 仓库 两个标签页都适用） */
+/* 1) 隐藏原生分页按钮。
+   三套分页 UI 都要盖住：经典 .paginate-container、Stars 的
+   [data-test-selector=pagination]、新版（issues/PR/提交/搜索）的
+   nav.prc-Pagination-* —— 后者的类名带哈希后缀，所以用类名前缀匹配。 */
 html.${HTML_FLAG} main .paginate-container,
-html.${HTML_FLAG} main [data-test-selector="pagination"] { display: none !important; }
+html.${HTML_FLAG} main [data-test-selector="pagination"],
+html.${HTML_FLAG} main nav[class*="PaginationContainer"],
+html.${HTML_FLAG} main div[class*="paginationWrapper"] { display: none !important; }
 
 /* 2) 触发哨兵 */
 #${SENTINEL_ID} { height: 1px; width: 100%; }
@@ -803,13 +976,15 @@ html.${HTML_FLAG} .ghsi-item {
     return s;
   }
 
-  function reset(frame, tab) {
+  function reset(frame, listId) {
     teardown(false);
 
-    const cfg = TABS[tab] || TABS.stars;
-    state.tab = tab;
+    const cfg = LISTS[listId] || LISTS.stars;
+    state.listId = listId;
     state.frameId = cfg.frameId;
     state.placeholderTag = cfg.placeholderTag;
+    state.keyKind = cfg.keyKind || 'repo';
+    state.itemSelectors = cfg.itemSelectors;
     state.frame = frame;
     state.seen = new Set();
     state.page = 1;
@@ -833,11 +1008,15 @@ html.${HTML_FLAG} .ghsi-item {
       firstNodes.push(el);
     }
 
-    // 追加/回收容器：仓库页的条目在一个 <ul> 里（不是帧的直接子元素），
-    // 要找到那个 <ul>；Stars 页条目就在帧里，直接用帧本身。
-    if (cfg.listMode === 'list' && firstNodes.length) {
+    // 追加/回收容器：多数列表的条目都装在一个 <ul>/<div> 容器里（不是帧的直接子元素），
+    // 要找到它；Stars 页条目就在帧里，直接用帧本身。
+    if (firstNodes.length && cfg.listMode !== 'frame') {
       const p = firstNodes[0].parentElement;
-      state.list = (p && /^(UL|OL)$/.test(p.tagName)) ? p : frame;
+      if (cfg.listMode === 'list') {
+        state.list = (p && /^(UL|OL)$/.test(p.tagName)) ? p : frame;
+      } else {                        // 'parent'：条目的直接父元素，任意标签
+        state.list = p || frame;
+      }
     } else {
       state.list = frame;
     }
@@ -874,7 +1053,8 @@ html.${HTML_FLAG} .ghsi-item {
       setStatus('idle', '已加载 ' + state.seen.size + ' 个仓库 · 向下滚动加载更多');
     }
     scheduleRecycle();
-    log('已启用[' + tab + '] ->', location.href, '| 首页条目', state.seen.size, '| list:', state.list && state.list.tagName, '| next:', state.nextUrl);
+    log('已启用[' + listId + '·' + cfg.label + '] ->', location.href,
+        '| 首页条目', state.seen.size, '| list:', state.list && state.list.tagName, '| next:', state.nextUrl);
   }
 
   function teardown(full) {
@@ -885,7 +1065,9 @@ html.${HTML_FLAG} .ghsi-item {
     if (state.statusEl) { try { state.statusEl.remove(); } catch (e) { /* ignore */ } state.statusEl = null; }
     if (state.scheduled) { clearTimeout(state.scheduled); state.scheduled = null; }
     if (full) document.documentElement.classList.remove(HTML_FLAG);
-    state.tab = null;
+    state.listId = null;
+    state.keyKind = 'repo';
+    state.itemSelectors = null;
     state.frame = null;
     state.frameId = null;
     state.list = null;
@@ -909,13 +1091,17 @@ html.${HTML_FLAG} .ghsi-item {
   }
 
   function boot() {
-    const tab = activeTab();
-    if (!tab) { teardown(true); return; }
-    state.tab = tab;   // 先设好，extractItems 才会用对选择器
+    const listId = activeList();
+    if (!listId) { teardown(true); return; }
+    const cfg = LISTS[listId];
+    // 先把列表配置挂上（extractItems 依赖它挑选择器），再去取帧
+    state.listId = listId;
+    state.keyKind = cfg.keyKind || 'repo';
+    state.itemSelectors = cfg.itemSelectors;
 
-    const frameId = TABS[tab].frameId;
-    const frame = document.getElementById(frameId) ||
-                  document.querySelector('turbo-frame#' + frameId);
+    const frame = cfg.frameId
+      ? (document.getElementById(cfg.frameId) || document.querySelector('turbo-frame#' + cfg.frameId))
+      : null;
     if (!frame) { teardown(true); return; }
 
     // 已经初始化过：哨兵还在（内容没被 Turbo 换掉）-> 不动
@@ -925,11 +1111,11 @@ html.${HTML_FLAG} .ghsi-item {
 
     // 内容还没渲染完（条目为 0 且也不是明确的空状态）-> 等下一次变化
     const hasItems = extractItems(frame).length > 0;
-    const emptyState = /hasn't starred|doesn't have any starred|no starred|haven't starred|any public repositories|doesn't have any repositories|no repositories yet/i
+    const emptyState = /hasn't starred|doesn't have any starred|no starred|haven't starred|any public repositories|doesn't have any repositories|no repositories yet|doesn't have any followers|doesn't follow anyone|no forks|no issues|no pull requests|no commits/i
       .test(frame.textContent || '');
     if (!hasItems && !emptyState) return;
 
-    reset(frame, tab);
+    reset(frame, listId);
   }
 
   /* ===================== Turbo / 导航兼容 ===================== */
@@ -947,7 +1133,7 @@ html.${HTML_FLAG} .ghsi-item {
     if (state.moTimer) return;
     state.moTimer = setTimeout(() => {
       state.moTimer = null;
-      if (!activeTab()) { if (state.frame) teardown(true); return; }
+      if (!activeList()) { if (state.frame) teardown(true); return; }
       if (state.frame && state.sentinel && state.frame.contains(state.sentinel)) return;
       if (state.frame && state.endMarker && state.frame.contains(state.endMarker)) return;
       boot();
@@ -966,9 +1152,9 @@ html.${HTML_FLAG} .ghsi-item {
   // 方便在控制台排查 / 手动触发
   window.GHStarsInfinite = {
     config: CONFIG,
-    tabs: TABS,
+    lists: LISTS,
     state: state,
-    activeTab: () => state.tab,
+    activeList: () => state.listId,
     pages: () => state.pages.map(p => ({
       index: p.index, recycled: p.recycled,
       cached: !!(p.nodes && p.nodes.length), count: p.nodes ? p.nodes.length : 0,

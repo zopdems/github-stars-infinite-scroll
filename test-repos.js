@@ -111,7 +111,7 @@ async function run() {
   const st = w.GHStarsInfinite.state;
 
   // --- 识别与结构 ---
-  ok('activeTab = repositories', st.tab === 'repositories');
+  ok('activeList = repositories', st.listId === 'repositories');
   ok('frameId = user-profile-frame', st.frameId === 'user-profile-frame');
   ok('追加容器是 <ul>（不是帧）', st.list && st.list.tagName === 'UL');
   ok('占位块标签 = li', st.placeholderTag === 'li');

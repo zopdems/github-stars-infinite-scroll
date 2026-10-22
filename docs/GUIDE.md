@@ -1,10 +1,21 @@
-# GitHub Stars / 仓库 无限滚动 —— 技术指南
+# GitHub 列表无限滚动 —— 技术指南
 
-一份给 GitHub 用户 **Stars** 和 **仓库（Repositories）** 两个标签页加"无限滚动"的用户脚本（Tampermonkey / Violentmonkey）。
+一份给 GitHub 上**所有可翻页列表**加"无限滚动"的用户脚本（Tampermonkey / Violentmonkey）。
 
 - **脚本文件**：`github-stars-infinite-scroll.user.js`
-- **适用范围**：任意用户的 `?tab=stars` 和 `?tab=repositories` 页（`https://github.com/{任意用户名}?tab=…`），不限于某个账号
+- **适用范围**：个人主页的 Stars / 仓库 / 关注者 / 正在关注，以及仓库的 Fork / 星标者 / 关注者 / Issues / Pull requests / 提交（共 10 类，见下表）
 - **依赖**：无。纯浏览器端，不改 GitHub 的 DOM 结构之外的任何东西，不需要服务器、不需要 Token
+
+| 列表 | 匹配 | 帧 id | 条目 | key |
+|---|---|---|---|---|
+| stars | `/{u}?tab=stars` | `user-starred-repos` | `div.col-12…border-bottom` | repo |
+| repositories | `/{u}?tab=repositories` | `user-profile-frame` | `ul > li.col-12…` | repo |
+| followers / following | `/{u}?tab=followers\|following` | `user-profile-frame` | `div.d-table.table-fixed…` | user |
+| forks | `/{o}/{r}/forks` | `repo-content-turbo-frame` | `ul > li.Box-row` | repo |
+| stargazers / watchers | `/{o}/{r}/stargazers\|watchers` | `repo-content-turbo-frame` | `ul > li.Box-row` | user |
+| issues | `/{o}/{r}/issues` | `repo-content-turbo-frame` | `ul > li` | issue |
+| pulls | `/{o}/{r}/pulls` | `repo-content-turbo-frame` | `ul > li` | pr |
+| commits | `/{o}/{r}/commits/{分支}` | `repo-content-turbo-frame` | `li[data-testid="commit-row-item"]` | commit |
 
 ---
 
@@ -55,7 +66,28 @@
 > </div>
 > ```
 
-**统一做法**：下一页地址一律复用分页区 Next 链接的 `href`，因此游标 / 页码两套机制都不用自己拼；容器、条目选择器、追加容器、占位块标签按 `tab` 在 `TABS` 里分流（见第二节）。
+### 其余列表（Fork / Issues / PR / 提交 / 关注者）
+
+| # | 结论 | 验证方式 / 影响 |
+|---|------|----------------|
+| 1 | 容器统一是 `<turbo-frame id="repo-content-turbo-frame">` | Fork / Issues / PR / 提交 都在这个帧里；关注者/正在关注仍是 `user-profile-frame` |
+| 2 | 分页 UI 有**两套**：`.paginate-container > .pagination > a.next_page`（Fork、关注者）和 `nav.prc-Pagination-PaginationContainer-*`（新版 React 分页，Issues / PR / 提交） | **很多列表根本没有 `.paginate-container`**，只在里面找 Next 会直接判成"最后一页"。必须放宽到全文档找 `rel=next` / `aria-label` 含 Next / `.next_page` / 文案 Next |
+| 3 | 条目都在 `ul > li` 里；Fork 是 `li.Box-row`，Issues/PR/提交是 `li`（新版带哈希类名 `listItem__xxxx`） | 类名带构建哈希会随发版变，所以**用标签 + key 过滤**，不依赖类名 |
+| 4 | 提交行带稳定属性 `data-commit-link="/{o}/{r}/commit/<sha>"` | 比解析链接更稳，优先用它取 key |
+| 5 | 条目里同一个仓库会有多个链接（名字、stargazers、forks…） | key 按**路径形态**取：`owner/repo`（两段）才是仓库；`…/stargazers` 是三段，不会误判。Fork 行里既有 fork 自己的 `/{owner}/{repo}`，也可能有"forked from"的源仓库 —— 取**第一个**匹配项即 fork 自身 |
+| 6 | 最后一页没有 Next 链接 | 终止信号同上 |
+
+> 新版 React 分页真实结构（类名带哈希后缀，所以用前缀匹配）：
+> ```html
+> <nav class="prc-Pagination-PaginationContainer-HEhGo" aria-label="Pagination">
+>   <div class="prc-Pagination-TablePaginationSteps-cAXs3">
+>     <a class="prc-Pagination-Page-Etgqf" aria-label="Next Page"
+>        href="/sindresorhus/type-fest/issues?q=is%3Aissue+state%3Aopen&page=2">Next</a>
+>   </div>
+> </nav>
+> ```
+
+**统一做法**：下一页地址一律复用 Next 链接的 `href`，因此游标 / 页码 / 搜索三套机制都不用自己拼；容器、条目选择器、追加容器、占位块标签、key 类型按列表类型在 `LISTS` 里分流（见第二节）。
 
 ---
 
@@ -92,10 +124,11 @@ DOMParser 解析 → 取 turbo-frame → 抽条目 → 按 owner/repo 去重
 
 | 模块 | 职责 |
 |------|------|
-| `activeTab()` | 页面识别：单段路径 + `tab` ∈ {stars, repositories} + 排除 GitHub 保留路径（`/topics`、`/marketplace`…） |
-| `TABS` | 按标签页配置：`frameId` / `itemSelectors` / `listMode`（追加容器是帧还是 `<ul>`）/ `placeholderTag`（占位块是 div 还是 li） |
-| `findFrame()` / `extractItems()` / `itemKey()` | DOM 抽取；选择器按当前 `TABS[state.tab]` 取，`itemKey` 只认 `h3` 里的仓库名链接 |
-| `extractNextUrl()` | 从分页区拿下一页地址（游标 / 页码通用）；拿不到就返回 `null` |
+| `activeList()` | 页面识别：对 `LISTS` 里每一类依次调 `match(路径片段, query)`，命中即返回列表 id；排除 GitHub 保留路径（`/topics`、`/marketplace`…） |
+| `LISTS` | 按列表类型配置：`match` / `frameId` / `itemSelectors` / `listMode`（frame 帧、list 父 `<ul>`、parent 父元素）/ `placeholderTag` / `keyKind` |
+| `KEY_PATTERNS` + `itemKey()` | 按 `keyKind`（repo / user / issue / pr / commit）从条目内的链接路径解析唯一 key；提交优先用 `data-commit-link` |
+| `findFrame()` / `extractItems()` / `dominantGroup()` | DOM 抽取；选择器按 `state.itemSelectors` 取，取完再按"候选项最多的父容器"过滤掉侧栏/页脚里的同类元素 |
+| `extractNextUrl()` / `pickNext()` / `isPrevLink()` | 找下一页：先查分页容器（三种），再放宽到全文档找 `rel=next` / aria / `.next_page` / 文案；排除 Previous |
 | `loadNext()` | 单次加载：节流 → 请求 → 解析 → 追加 → 推进 / 结束 |
 | `finish()` | 终止：解绑观察、打结束标记、显示"已到底" |
 | `recycleAbove()` / `rehydrateAbove()` / `recyclePage()` / `rehydratePage()` | 滚动回收与回看补回：整页 ↔ 等高占位块 的互换，按页缓存支撑 |
@@ -270,35 +303,45 @@ function rehydrateAbove() {
 
 `rAF` 节流 + **按滚动方向分流**：向下滚只做回收、向上滚只做补回，平时几乎零开销。设 `CONFIG.recycle = false` 即可退回"全部常驻 DOM"的旧行为。
 
-### 10. 一套脚本吃两个标签页（v1.4.0）：Stars + 仓库
+### 10. 一套脚本吃所有列表（v1.5.0）：`LISTS` 注册表
 
-Stars 和仓库两个标签页的分页机制、容器、条目结构都不同，用一张 `TABS` 表按 `tab` 参数分流，其余逻辑（加载 / 去重 / 回收 / 补回 / 重试）完全复用：
+各类列表的分页机制、容器、条目结构、去重维度都不同，用一张 `LISTS` 表按**路径 + query** 分流，其余逻辑（加载 / 去重 / 回收 / 补回 / 重试）完全复用：
 
 ```js
-const TABS = {
+const LISTS = {
   stars: {
+    label: '星标',
+    match: (seg, q) => seg.length === 1 && q.get('tab') === 'stars',
     frameId: 'user-starred-repos',
     itemSelectors: ['div[class*="col-12"][class*="border-bottom"]', …],
-    listMode: 'frame',      // 追加容器 = 帧本身
-    placeholderTag: 'div'
+    listMode: 'frame', placeholderTag: 'div', keyKind: 'repo'
   },
-  repositories: {
-    frameId: 'user-profile-frame',
-    itemSelectors: ['li[class*="col-12"][class*="border-bottom"]', …],
-    listMode: 'list',       // 追加容器 = 条目所在的 <ul>
-    placeholderTag: 'li'    // 占位块用 <li>，保持 <ul> 结构合法
-  }
+  forks: {
+    label: 'Fork 分支',
+    match: (seg) => seg.length === 3 && seg[2] === 'forks',
+    frameId: 'repo-content-turbo-frame',
+    itemSelectors: ['li.Box-row', 'ul > li'],
+    listMode: 'parent', placeholderTag: 'li', keyKind: 'repo'
+  },
+  issues: { … match: (seg) => seg.length === 3 && seg[2] === 'issues',
+            itemSelectors: ['ul > li'], keyKind: 'issue' },
+  commits: { … match: (seg) => seg.length >= 3 && seg[2] === 'commits',
+             itemSelectors: ['li[data-testid="commit-row-item"]', …], keyKind: 'commit' },
+  /* … repositories / followers / following / stargazers / watchers / pulls */
 };
 ```
 
-四个必须跟着标签页走的东西：
+五个必须跟着列表类型走的东西：
 
-1. **帧 id**（`state.frameId`）：Stars=`user-starred-repos`，仓库=`user-profile-frame`。`fetchPage` 的 `Turbo-Frame` 头、`findFrame` 都用它。
-2. **条目选择器**（`extractItems` 按 `TABS[state.tab]` 取）：Stars 是 `div`，仓库是 `li`。`itemKey` 只认 `h3` 里的仓库名链接，所以仓库条目里的 `stargazers` / `forks` 三段路径链接不会被误当成 key。
-3. **追加容器**（`state.list`）：仓库的 `li` 在一个 `<ul>` 里，不能往帧上直接 `appendChild`（会掉到 `<ul>` 外面破坏布局）。`reset()` 里取"第一个条目的父元素"，是 `UL/OL` 就用作追加容器，否则退回帧本身。
-4. **占位块标签**（`state.placeholderTag`）：仓库页回收出来的占位块得是 `<li>` 才能待在 `<ul>` 里；用 `<div>` 会破坏列表语义。CSS 里给 `.ghsi-pholder` 重置了 `list-style/margin/padding`，作为 `<li>` 也干净。
+1. **匹配规则**（`match`）：个人主页是单段路径 + `tab=`；仓库子页是 `/{owner}/{repo}/{子页}`。要排掉 `/{o}/{r}/issues/123`（单条 issue）——用 `seg.length === 3` 精确匹配。
+2. **帧 id**（`state.frameId`）：主页类 `user-profile-frame` / `user-starred-repos`，仓库类 `repo-content-turbo-frame`。`fetchPage` 的 `Turbo-Frame` 头、`findFrame` 都用它。
+3. **条目选择器 + key 类型**：见上表。key 按**链接路径形态**解析（不依赖包装标签），所以 Fork 的仓库名在 `h2`、仓库列表在 `h3` 都能认。
+4. **追加容器**（`state.list`）：`listMode` 三种 —— `frame`（Stars 直接挂帧上）/ `list`（取父 `<ul>`/`<ol>`）/ `parent`（取条目的直接父元素，任意标签，覆盖 followers 的 `div` 容器和 React 列表的 `ul`）。直接往帧上 `appendChild` 会让条目掉到 `<ul>` 外面破坏布局。
+5. **占位块标签**（`state.placeholderTag`）：条目在 `<ul>` 里时占位块必须是 `<li>`。CSS 给 `.ghsi-pholder` 重置了 `list-style/margin/padding`。
 
-下一页地址两套机制通用：**一律复用 Next 链接 href**（Stars 的 `after` 游标、仓库的 `page=N` 都带上当前排序/过滤参数），所以 `extractNextUrl` 不用改，`type=source` 之类的过滤条件也自动保留。
+**下一页地址三套机制通用**：一律复用 Next 链接 href（Stars/提交的 `after` 游标、其余的 `page=N` 都自带当前过滤参数），所以 `extractNextUrl` 只需**放宽查找范围**，不用为每种分页写分支。
+
+另外 `extractItems` 加了一道"`dominantGroup`"过滤：把候选项按父容器分组，只保留**候选项最多的那一组**。Fork 页用 `ul > li` 会多抓到 4 个侧栏里的同类 `li`，这道过滤正好把它们丢掉（实测 29 → 25）。
 
 ---
 
@@ -327,11 +370,16 @@ const TABS = {
 
 ### 3. 用
 
-打开任意用户的 Stars 或 仓库 页，例如：
+打开任一受支持的列表页，例如：
 
 ```
-https://github.com/zopdems?tab=stars
-https://github.com/zopdems?tab=repositories        # 加 &type=source 只看非 fork
+https://github.com/zopdems?tab=stars                 # 星标
+https://github.com/zopdems?tab=repositories          # 仓库（&type=source 只看非 fork）
+https://github.com/zopdems?tab=followers             # 关注者
+https://github.com/torvalds/linux/forks              # Fork 分支
+https://github.com/sindresorhus/type-fest/issues     # Issues
+https://github.com/kubernetes/kubernetes/pulls       # Pull requests
+https://github.com/torvalds/linux/commits/master     # 提交
 ```
 
 - 向下滚动 → 自动加载，页面不跳转、滚动位置不变
@@ -562,3 +610,26 @@ function onUserScroll() {
 - 回归：重构后 **Stars 页对真实 HTML 依然正常**（`activeTab=stars`、30 条铺底、`after` 游标、加载第 2 页后 60 条）
 
 > ⚠️ 抓取踩坑（与脚本无关）：本机 curl 带 `Turbo-Frame` 头抓 Stars 第 2 页时，偶发返回一个标题为 "American Airlines" 的无关页面（疑似网络/CDN 干扰）。脚本对"解析不到条目"的情况会**安全停止**而不是死循环，正好兜住了这种脏数据。
+
+**多种列表（v1.5.0，`test-lists.js` 80 项断言全过 + 5 类真实页面复验）**
+
+合成页（结构对齐实测，覆盖 followers / following / forks / stargazers / watchers / issues / pulls / commits 八类）：
+
+- 每类都能正确识别 `listId`、`keyKind`，首页解析出 4 条且 key 前缀正确（`user:` / `issue:` / `pr:` / `commit:` / 仓库无前缀）
+- 每类都能取到 nextUrl，翻到第 2 页追加 4 条、累计 8 条
+- 每类都能回收第 1 页（占位块标签 = 该列表配的 `li` / `div`）并回看补回
+
+真实页面复验（curl 抓线上第 1/2 页，jsdom 注入脚本）：
+
+| 列表 | 首页条目 | key 样例 | 第 2 页 |
+|---|---|---|---|
+| followers | 50 | `user:jrb9000` | 追加 50 → 累计 100 |
+| forks | 25 | `asahilinux/linux` | 追加 25 → 累计 50 |
+| issues | 25 | `issue:sindresorhus/type-fest#1385` | 追加 25 → 累计 50 |
+| pulls | 25 | `pr:kubernetes/kubernetes#143303` | 追加 25 → 累计 50 |
+| commits | 32 | `commit:4df4d2a577db…` | 追加 24 → 累计 56（8 条跨页重复被去重，符合预期） |
+
+回归：`test-recycle.js`（Stars）20/20、`test-repos.js`（仓库）21/21 仍全过，共 **121 项断言**。
+
+> 未覆盖：`/search`（纯 React 应用，会重渲染清掉追加内容，容器类名带构建哈希）；
+> `/{仓库}/stargazers`、`/{仓库}/watchers` 匿名访问 404（需登录），结构与 Fork 同构故一并登记，未做真实验证。
