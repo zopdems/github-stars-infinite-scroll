@@ -2,7 +2,7 @@
 // @name         GitHub 列表无限滚动
 // @name:zh-CN   GitHub Stars 无限滚动
 // @namespace    https://github.com/
-// @version      1.6.0
+// @version      1.6.1
 // @description  给 GitHub 上所有可翻页的列表加自动翻页：Stars、仓库、关注者/正在关注、Fork、星标者、关注者、Issues、Pull requests、Releases、提交。滚动接近底部自动加载并追加到末尾，隐藏原生分页，到底给出提示，失败滚动重试；支持滚动回收（上方整页换等高占位块、回看补回），长列表不卡顿。
 // @author       zopdems
 // @license      MIT
@@ -340,8 +340,7 @@
       if (!ph) { page.fetching = false; return; }
       const html = await fetchPage(page.url, true);
       const doc = parseDoc(html);
-      const frame = findFrame(doc);
-      const items = extractItems(frame);
+      const items = extractList(findFrame(doc)).items;
       const nodes = [];
       for (const el of items) {
         const key = itemKey(el);
@@ -557,6 +556,59 @@
     if (!best || !best.el) return items;
     const out = items.filter(el => v.voteOf.get(el) === best.el);
     return out.length ? out : items;
+  }
+
+  /**
+   * 把条目归一到"列表容器的直接子元素"。
+   * 为什么需要：Releases 里匹配到的是内层 div.Box，而真正的条目是外面的
+   * <section id="release-xxx">。如果不归一，回收时只摘得走内层，外面的 section
+   * 会变成一排空壳留在页面上；追加时也会追加成裸 div，和原生结构不一致。
+   * 只有"一对一"时才归一（每个条目各有各的直接子元素外壳）；
+   * 若多个条目同属一个直接子元素，说明条目本身就是直接子元素，保持原样。
+   */
+  function normalizeToChildren(items, container) {
+    if (!container || !items.length) return items;
+    const childOf = new Map();
+    for (const el of items) {
+      let a = el;
+      while (a && a.parentElement && a.parentElement !== container) a = a.parentElement;
+      if (!a || a.parentElement !== container) return items;   // 有条目不在容器内，别乱归一
+      if (!childOf.has(a)) childOf.set(a, []);
+      childOf.get(a).push(el);
+    }
+    if (childOf.size === items.length) return Array.from(childOf.keys());
+    return items;
+  }
+
+  /**
+   * 完整抽取：选择器匹配 → 剔掉侧栏杂项 → 定位列表容器 → 归一到直接子元素。
+   * 返回 { items, container }，追加 / 回收都以 container 的直接子元素为单位。
+   */
+  function extractList(frame) {
+    const sels = state.itemSelectors || FALLBACK_ITEM_SELECTORS;
+    for (const sel of sels) {
+      const cands = Array.from(frame.querySelectorAll(sel)).filter(el => itemKey(el));
+      const top = cands.filter(el => !cands.some(o => o !== el && o.contains(el)));
+      if (!top.length) continue;
+      const kept = dominantGroup(top);
+      if (!kept.length) continue;
+      const container = dominantContainer(kept);
+      if (container && container.el) {
+        return { items: normalizeToChildren(kept, container.el), container: container.el };
+      }
+      return { items: kept, container: null };
+    }
+    const fb = Array.from(frame.children).filter(el => itemKey(el));
+    const kept = dominantGroup(fb);
+    const container = dominantContainer(kept);
+    return {
+      items: kept.length ? kept : fb,
+      container: (container && container.el) ? container.el : frame
+    };
+  }
+
+  function extractItems(frame) {
+    return extractList(frame).items;
   }
 
   /** 一个链接是不是「上一页」，是就排除 */
@@ -829,19 +881,17 @@ html.${HTML_FLAG} .ghsi-item {
     setStatus('loading', '正在加载第 ' + state.page + ' 页…');
 
     const url = state.nextUrl;
-    let doc, frame, items;
+    let doc, items;
     try {
       // 首选：带 Turbo-Frame 头，只拿片段
       doc = parseDoc(await fetchPage(url, true));
-      frame = findFrame(doc);
-      items = extractItems(frame);
+      items = extractList(findFrame(doc)).items;
 
       // 兜底：拿不到条目就不带头重抓整页再解析一次
       if (!items.length) {
         log('片段解析为空，改用整页解析');
         doc = parseDoc(await fetchPage(url, false));
-        frame = findFrame(doc);
-        items = extractItems(frame);
+        items = extractList(findFrame(doc)).items;
       }
 
       if (!items.length) {
@@ -1051,10 +1101,10 @@ html.${HTML_FLAG} .ghsi-item {
     state.loadedUrl = null;
     state.lastScrollY = window.scrollY || window.pageYOffset || 0;
 
-    // 用页面上已有的条目铺底，避免重复；同时给它们打上优化标记
-    // （首页那 30 条同样参与长列表渲染，不标记的话第一屏之后照样卡）
+    // 抽条目 + 定位列表容器（Releases 会归一到外层的 <section>，见 normalizeToChildren）
+    const list = extractList(frame);
     const firstNodes = [];
-    for (const el of extractItems(frame)) {
+    for (const el of list.items) {
       const k = itemKey(el);
       if (!k) continue;
       state.seen.add(k);
@@ -1063,16 +1113,8 @@ html.${HTML_FLAG} .ghsi-item {
       firstNodes.push(el);
     }
 
-    // 追加/回收容器：多数列表的条目都装在一个 <ul>/<div> 容器里（不是帧的直接子元素），
-    // 要找到它；Stars 页条目就在帧里，直接用帧本身。
-    // 用 dominantContainer 而不是直接取父元素 —— Releases 的每个 div.Box 外还包了一层
-    // 无 class 的 div，只有祖父容器才装得下全部条目。
-    if (firstNodes.length && cfg.listMode !== 'frame') {
-      const dc = dominantContainer(firstNodes);
-      state.list = dc ? dc.el : (firstNodes[0].parentElement || frame);
-    } else {
-      state.list = frame;
-    }
+    // 追加/回收容器：Stars 条目就在帧里，直接用帧本身；其余用投票定位到的列表容器。
+    state.list = (cfg.listMode === 'frame' || !list.container) ? frame : list.container;
 
     state.nextUrl = extractNextUrl(frame);
 

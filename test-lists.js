@@ -159,6 +159,11 @@ async function run() {
     w.GHStarsInfinite.recycleNow();
     await tick();
     ok('第1页已回收', st.pages[0].recycled === true);
+    // 回归：回收必须整条摘走。若只摘到内层元素（如 Releases 的 div.Box 而留下外层
+    // <section>），容器里会多出一排空壳 —— 用子元素数量卡住这个回归。
+    ok('回收后无空壳残留（子元素数 = 剩余条目 + 占位块）',
+       st.list.children.length === spec.per + 1,
+       st.list.children.length);
     const ph = st.list.querySelector('.ghsi-pholder[data-gh-page="1"]');
     ok(`占位块标签 = ${st.placeholderTag.toUpperCase()}`, !!ph && ph.tagName === st.placeholderTag.toUpperCase(), ph && ph.tagName);
 

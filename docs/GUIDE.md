@@ -94,9 +94,10 @@
 |---|------|----------------|
 | 1 | 分页是**经典** `.paginate-container` + `?page=N` | Next 链接 `a[aria-label="Next page"]`，与其它仓库子页一致 |
 | 2 | 条目是 `div.Box`（release 卡片），容器 `repo-content-turbo-frame` | 帧里 `div.Box` 能匹配到 31 个，但有 release 链接的只有 10 个 —— 靠 key 过滤 |
-| 3 | **每个 release 的 `div.Box` 外面还套了两层**：一个无 class 的 `div`，再外面一个 `div.tmp-my-5`，而且**每个 release 各有一份** | 所以父元素、祖父元素都不对 —— 任何"固定层级"的做法在这里必然失败 |
-| 4 | 真正的列表容器是这三层之上的公共祖先（实测 `div.col-md-9`） | 只能靠"投票"算法定位，见第二节 `dominantContainer` |
-| 5 | 版本名链接是 `/o/r/releases/tag/{tag}` | key = `release:owner/repo@tag`（tag 做 URL 解码 + 小写） |
+| 3 | **真正的条目元素是 `<section id="release-v0.21.0">`，`div.Box` 只是它内部的一层** | 如果拿内层的 `div.Box` 当条目：回收时只摘得走内层，外面的 `section` 会变成一排**空壳**留在页面上；追加时也会追加成裸 `div`，和原生结构不一致。所以抽完条目要做一次「归一到列表容器的直接子元素」（见第二节 `normalizeToChildren`） |
+| 4 | **每个 release 的 `div.Box` 外面还套了两层**：一个无 class 的 `div`，再外面一个 `div.tmp-my-5`，而且**每个 release 各有一份** | 所以父元素、祖父元素都不对 —— 任何"固定层级"的做法在这里必然失败 |
+| 5 | 真正的列表容器是这三层之上的公共祖先（实测 `div.col-md-9`） | 只能靠"投票"算法定位，见第二节 `dominantContainer` |
+| 6 | 版本名链接是 `/o/r/releases/tag/{tag}` | key = `release:owner/repo@tag`（tag 做 URL 解码 + 小写） |
 
 **统一做法**：下一页地址一律复用 Next 链接的 `href`，因此游标 / 页码 / 搜索三套机制都不用自己拼；容器、条目选择器、追加容器、占位块标签、key 类型按列表类型在 `LISTS` 里分流（见第二节）。
 
@@ -385,6 +386,36 @@ function voteContainers(items) {
 > ⚠️ 曾经走过的弯路：先试过"取候选项最多的父容器"（Releases 每个 Box 的父容器都不同，直接失效），
 > 又试过"取包含全部条目的最低公共祖先"（ Issues 页有个杂项只能爬到高层，反而把 25 条真条目 + 1 个杂项
 > 一起圈进来，多抓了一条）。最后才定在"投票 + 只保留投给冠军的条目"。
+
+### 抽到的条目还要"归一到直接子元素"
+
+光定位到容器还不够 —— 选择器匹配到的可能只是条目的**内层**。Releases 就是这种情况：
+匹配到的是 `div.Box`，而真正的条目是外面的 `<section id="release-xxx">`。
+
+不归一的后果（v1.6.0 的真实 bug，用户反馈"往下翻，下面先是有之前版本的，然后才是现在版本的"）：
+
+- 回收时只摘得走内层 `div.Box`，外面的 `section` 变成一排**空壳**留在页面上；
+- 追加时追加的是裸 `div.Box`，和原生结构不一致，也可能丢样式。
+
+```js
+function normalizeToChildren(items, container) {
+  const childOf = new Map();
+  for (const el of items) {
+    let a = el;
+    while (a && a.parentElement && a.parentElement !== container) a = a.parentElement;
+    if (!a || a.parentElement !== container) return items;          // 有条目不在容器内，别乱归一
+    if (!childOf.has(a)) childOf.set(a, []);
+    childOf.get(a).push(el);
+  }
+  return childOf.size === items.length ? [...childOf.keys()] : items;  // 一对一才归一
+}
+```
+
+**只有"一对一"时才归一**：每个条目各有各的直接子元素外壳。反过来，如果多个条目同属一个直接子元素
+（说明条目本身就是直接子元素，比如 `ul > li`），就保持原样 —— 这样对其它列表完全无影响。
+
+复验（v1.6.1，6 类真实页面）：releases 条目 = `<section>`、forks/issues/pulls/commits = `<li>`、
+followers = `<div>`，且**全部都是列表容器的直接子元素**；回收后容器里只剩占位块，无空壳。
 
 ---
 
@@ -696,6 +727,19 @@ function onUserScroll() {
 Releases 端到端：首页 10 条 → 加载第 2 页追加 10 条累计 20 条 → next 指向 `page=3` → 回收第 1 页为 1200px 占位块 → 回看补回 10 条。
 
 回归：Stars 20/20、仓库 21/21，共 **131 项断言**。
+
+**修复回收空壳（v1.6.1，真实页面 16 项端到端断言全过 + `test-lists.js` 增至 99 项）**
+
+- 症状：Releases 往下翻时，下方先是一排"之前版本的"空卡片，然后才是新内容 —— 因为抽到的条目是内层
+  `div.Box`，回收只摘得走内层，外层 `<section>` 变成空壳留在页面上。
+- 修复：`extractList()` 里加一步 `normalizeToChildren()`，把条目归一到**列表容器的直接子元素**
+  （仅在一对一时才归一，对 `ul > li` 等列表无影响）。
+- 真实页面端到端（beszel/releases 第 1+2 页）：首页 10 条 `<section>` → 第 2 页追加 10 条 `<section>`
+  → 顺序 v0.21.0 → … → v0.18.2 → v0.18.1 → v0.18.0 → … → v0.15.0 → next 指向 `page=3`
+  → 回收后容器内**只剩占位块、0 个空壳** → 回看补回 10 条、顺序恢复。
+- 6 类真实页面复验条目数/条目标签/是否容器直接子元素全部正确。
+- 新增回归断言：回收后「容器子元素数 = 剩余条目 + 占位块」，专门卡住"留空壳"这类回归。
+- 回归：Stars 20/20、仓库 21/21、lists 99/99，共 **140 项断言**。
 
 > 未覆盖：`/search`（纯 React 应用，会重渲染清掉追加内容，容器类名带构建哈希）；
 > `/{仓库}/stargazers`、`/{仓库}/watchers` 匿名访问 404（需登录），结构与 Fork 同构故一并登记，未做真实验证。
